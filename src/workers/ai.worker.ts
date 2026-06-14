@@ -187,14 +187,18 @@ async function getCocoDetector(): Promise<any> {
   const tfjs = await import('@tensorflow/tfjs');
   const cocoSsd = await import('@tensorflow-models/coco-ssd');
 
+  // Force CPU backend explicitly. Inside a Web Worker, WebGL is not available,
+  // so TF.js defaults to trying WebGL and fails with "Failed to compile fragment shader".
+  // The CPU backend works reliably in worker threads for COCO-SSD inference.
+  await tfjs.setBackend('cpu');
+  await tfjs.ready();
+
   self.postMessage({
     type: 'PROGRESS',
     payload: { status: 'loading', percentage: 40, model: 'COCO-SSD' },
   });
 
-  // Load the object detection model (uses default CPU backend)
-  // The WebAssembly backend requires @tensorflow/tfjs-backend-wasm which is not installed.
-  // The default backend works fine for COCO-SSD inference.
+  // Load the object detection model
   cocoDetector = await cocoSsd.load();
 
   self.postMessage({
