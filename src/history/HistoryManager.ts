@@ -44,6 +44,9 @@ export interface HistorySnapshot {
   lightIntensity: number;
   hasMask: boolean;
   maskId: string | null;
+  semanticBackgroundEnabled: boolean;
+  semanticColorA: string | null;
+  semanticColorB: string | null;
 }
 
 export type StateReader = () => HistorySnapshot;

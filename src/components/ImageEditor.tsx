@@ -7,6 +7,13 @@ import { HistoryManager, HistorySnapshot, SnapshotCommand, HistoryActionType } f
 import { saveProject, loadProject, saveMask, generateProjectId } from '../utils/indexedDB';
 import './ImageEditor.css';
 
+const rgbToHex = (rgb: number[]) => {
+  const r = Math.round(rgb[0] * 255);
+  const g = Math.round(rgb[1] * 255);
+  const b = Math.round(rgb[2] * 255);
+  return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase()}`;
+};
+
 const ImageEditor: React.FC = () => {
   // Canvas refs
   const phase1CanvasRef = useRef<HTMLCanvasElement>(null);
@@ -53,6 +60,7 @@ const ImageEditor: React.FC = () => {
 
   // Saved indicator
   const [lastSaved, setLastSaved] = useState<string>('');
+  const [isSemanticBgEnabled, setIsSemanticBgEnabled] = useState(false);
 
   // ===== State Reader/Writer for HistoryManager =====
   // Reads the current state from all managers into a HistorySnapshot
@@ -74,6 +82,9 @@ const ImageEditor: React.FC = () => {
       lightIntensity: wm?.filterState.lightIntensity ?? 0,
       hasMask: cm?.isMaskActive() ?? false,
       maskId: null,
+      semanticBackgroundEnabled: wm?.semanticBackgroundEnabled ?? false,
+      semanticColorA: wm?.semanticColors?.[0] ? rgbToHex(wm.semanticColors[0]) : null,
+      semanticColorB: wm?.semanticColors?.[1] ? rgbToHex(wm.semanticColors[1]) : null,
     };
   }, []);
 
@@ -101,6 +112,15 @@ const ImageEditor: React.FC = () => {
     cm.resetState();
     // Apply the restored state
     cm.setZoom(snapshot.zoom);
+    
+    if (snapshot.semanticBackgroundEnabled && snapshot.semanticColorA && snapshot.semanticColorB) {
+      wm.enableSemanticBackground(snapshot.semanticColorA, snapshot.semanticColorB);
+      setIsSemanticBgEnabled(true);
+    } else {
+      wm.disableSemanticBackground();
+      setIsSemanticBgEnabled(false);
+    }
+
     // We need to manually set translate/rotation/flip since setZoom only handles zoom
     // Use a workaround: directly assign to internal state
     (cm as any).state.translateX = snapshot.translateX;
@@ -298,6 +318,14 @@ const ImageEditor: React.FC = () => {
             }
             setIsAILoading(false);
             break;
+          case 'COLORS_EXTRACTED':
+            if (payload.colors && payload.colors.length >= 2 && webglManagerRef.current) {
+              webglManagerRef.current.enableSemanticBackground(payload.colors[0], payload.colors[1]);
+              setIsSemanticBgEnabled(true);
+              recordHistoryState('UPDATE_FILTER');
+            }
+            setIsAILoading(false);
+            break;
           case 'ERROR':
             setError(`AI error: ${payload}`);
             setIsAILoading(false);
@@ -352,6 +380,43 @@ const ImageEditor: React.FC = () => {
     getAIWorker().postMessage({ type: 'SMART_CROP', imageData, maskData }, transferables);
   }, [getAIWorker]);
 
+  const handleSemanticBackground = useCallback(() => {
+    const cm = canvasManagerRef.current;
+    if (!cm) return;
+
+    if (isSemanticBgEnabled && webglManagerRef.current) {
+      webglManagerRef.current.disableSemanticBackground();
+      setIsSemanticBgEnabled(false);
+      recordHistoryState('UPDATE_FILTER');
+      return;
+    }
+
+    if (!cm.isMaskActive()) {
+      setError('Please remove the background first before applying a semantic background.');
+      return;
+    }
+
+    setIsAILoading(true);
+    setAiProgress(0);
+    setAiModelName('K-Means');
+
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = 100;
+    tempCanvas.height = 100;
+    const tempCtx = tempCanvas.getContext('2d');
+    if (!tempCtx) { setIsAILoading(false); return; }
+
+    tempCtx.drawImage(cm.getImageElement(), 0, 0, 100, 100);
+    const downscaledImage = tempCtx.getImageData(0, 0, 100, 100);
+
+    const maskCanvas = (cm as any).maskCanvas as HTMLCanvasElement;
+    tempCtx.clearRect(0, 0, 100, 100);
+    if (maskCanvas) tempCtx.drawImage(maskCanvas, 0, 0, 100, 100);
+    const downscaledMask = tempCtx.getImageData(0, 0, 100, 100);
+
+    getAIWorker().postMessage({ type: 'EXTRACT_COLORS', imageData: downscaledImage, maskData: downscaledMask }, [downscaledImage.data.buffer, downscaledMask.data.buffer]);
+  }, [isSemanticBgEnabled, getAIWorker, recordHistoryState]);
+
   // ===== File Handling =====
   const processImageBlob = useCallback((blob: Blob) => {
     currentBlobRef.current = blob;
@@ -369,6 +434,8 @@ const ImageEditor: React.FC = () => {
     }
     // Reset history for new image
     historyManagerRef.current?.clear();
+    setIsSemanticBgEnabled(false);
+    if (webglManagerRef.current) webglManagerRef.current.disableSemanticBackground();
   }, []);
 
   const handleFileSelect = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -443,6 +510,53 @@ const ImageEditor: React.FC = () => {
     } catch (e: any) {
       setError(`Export failed: ${e?.message || 'Unknown error'}`);
     } finally {
+      setIsExporting(false);
+    }
+  }, []);
+
+  // ===== Parallax Video =====
+  const handleExportVideo = useCallback(async () => {
+    const cm = canvasManagerRef.current;
+    if (!cm || !cm.isMaskActive()) {
+      setError('Please remove the background first before exporting a 3D parallax video.');
+      return;
+    }
+
+    setIsExporting(true);
+    setError(null);
+
+    try {
+      const { ParallaxEngine } = await import('../core/ParallaxEngine');
+      const engine = new ParallaxEngine();
+      engine.setSourceImage(cm.getImageElement());
+      engine.setMaskCanvas((cm as any).maskCanvas);
+
+      const worker = new Worker(new URL('../workers/videoEncoder.worker.ts', import.meta.url), { type: 'module' });
+      
+      worker.onmessage = (e: MessageEvent) => {
+        const { type, payload } = e.data;
+        if (type === 'COMPLETE') {
+          if (payload.blob) ExportEngine.downloadBlob(payload.blob, payload.filename);
+          worker.terminate();
+          setIsExporting(false);
+          engine.destroy();
+        } else if (type === 'ERROR') {
+          setError(payload.error);
+          worker.terminate();
+          setIsExporting(false);
+          engine.destroy();
+        }
+      };
+
+      worker.postMessage({ type: 'INIT_ENCODE', width: cm.getImageWidth(), height: cm.getImageHeight(), fps: 30, totalFrames: 90 });
+
+      await engine.renderParallaxVideo(undefined, async (bitmap, frameNumber) => {
+        worker.postMessage({ type: 'ENCODE_FRAME', frameNumber, bitmap }, [bitmap]);
+      });
+
+      worker.postMessage({ type: 'FLUSH' });
+    } catch (e: any) {
+      setError(`Video export failed: ${e?.message || 'Unknown error'}`);
       setIsExporting(false);
     }
   }, []);
@@ -586,6 +700,13 @@ const ImageEditor: React.FC = () => {
               Smart Crop
             </button>
 
+            <button className={`toolbar-button ai-button ${isSemanticBgEnabled ? 'active' : ''}`} onClick={handleSemanticBackground} disabled={isAILoading} title="Smart Semantic Background" style={{ color: isSemanticBgEnabled ? '#4ade80' : '' }}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+              </svg>
+              Semantic BG
+            </button>
+
             <div className="toolbar-separator" />
 
             {/* Export Button */}
@@ -596,6 +717,14 @@ const ImageEditor: React.FC = () => {
                 <line x1="12" y1="15" x2="12" y2="3" />
               </svg>
               Export
+            </button>
+
+            <button className="toolbar-button export-button" onClick={handleExportVideo} disabled={isExporting} title="Export 3D Parallax Video">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polygon points="23 7 16 12 23 17 23 7" />
+                <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+              </svg>
+              3D Video
             </button>
           </>
         )}

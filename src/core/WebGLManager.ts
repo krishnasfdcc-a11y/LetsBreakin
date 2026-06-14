@@ -89,6 +89,51 @@ void main() {
 }
 `;
 
+// Background Gradient Shader
+const bgVertexShaderSource = `#version 300 es
+in vec2 a_position;
+out vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_uv = a_position * 0.5 + 0.5;
+}
+`;
+
+const bgFragmentShaderSource = `#version 300 es
+precision mediump float;
+in vec2 v_uv;
+out vec4 outColor;
+uniform vec3 u_colorA;
+uniform vec3 u_colorB;
+void main() {
+  outColor = vec4(mix(u_colorA, u_colorB, v_uv.y), 1.0);
+}
+`;
+
+// Particle Engine Shaders
+const particleVertexShaderSource = `#version 300 es
+in vec2 a_position;
+in vec2 a_velocity;
+uniform float u_time;
+void main() {
+  vec2 pos = a_position + a_velocity * u_time * 0.1;
+  pos = mod(pos + 1.0, 2.0) - 1.0;
+  gl_Position = vec4(pos, 0.0, 1.0);
+  gl_PointSize = 12.0 + sin(u_time * 2.0 + a_position.x * 10.0) * 6.0;
+}
+`;
+
+const particleFragmentShaderSource = `#version 300 es
+precision mediump float;
+out vec4 outColor;
+void main() {
+  float dist = length(gl_PointCoord - vec2(0.5));
+  if (dist > 0.5) discard;
+  float alpha = smoothstep(0.5, 0.0, dist) * 0.5;
+  outColor = vec4(1.0, 1.0, 1.0, alpha);
+}
+`;
+
 export class WebGLManager {
   // Canvas references
   private phase1Canvas: HTMLCanvasElement;
@@ -110,6 +155,22 @@ export class WebGLManager {
   private satLoc: WebGLUniformLocation | null = null;
   private lightAngleLoc: WebGLUniformLocation | null = null;
   private lightIntensityLoc: WebGLUniformLocation | null = null;
+
+  // Feature 1.5: Semantic Background State
+  public semanticBackgroundEnabled: boolean = false;
+  public semanticColors: [number[], number[]] = [[0, 0, 0], [0, 0, 0]];
+  private bgProgram: WebGLProgram | null = null;
+  private particleProgram: WebGLProgram | null = null;
+  private particleBuffer: WebGLBuffer | null = null;
+  private numParticles: number = 100;
+  private startTime: number = performance.now();
+  
+  private bgPosLoc: number = -1;
+  private bgColorALoc: WebGLUniformLocation | null = null;
+  private bgColorBLoc: WebGLUniformLocation | null = null;
+  private particlePosLoc: number = -1;
+  private particleVelLoc: number = -1;
+  private particleTimeLoc: WebGLUniformLocation | null = null;
 
   // Attribute locations
   private positionLoc: number = -1;
@@ -248,64 +309,58 @@ export class WebGLManager {
     return shader;
   }
 
+  private createProgram(gl: WebGL2RenderingContext | WebGLRenderingContext, vsSource: string, fsSource: string): WebGLProgram {
+    const vertexShader = this.compileShader(gl, gl.VERTEX_SHADER, vsSource);
+    const fragmentShader = this.compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+    const program = gl.createProgram();
+    if (!program) throw new Error('Failed to create program');
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      const info = gl.getProgramInfoLog(program);
+      gl.deleteProgram(program);
+      throw new Error(`Program link failed: ${info}`);
+    }
+    gl.deleteShader(vertexShader);
+    gl.deleteShader(fragmentShader);
+    return program;
+  }
+
   // ===================== Part 5: Program Linking & Memory Cleanup =====================
 
   private initShaders(): void {
     const gl = this.gl;
     if (!gl) return;
 
-    // Compile vertex shader
-    const vertexShader = this.compileShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+    this.program = this.createProgram(gl, vertexShaderSource, fragmentShaderSource);
+    this.bgProgram = this.createProgram(gl, bgVertexShaderSource, bgFragmentShaderSource);
+    this.particleProgram = this.createProgram(gl, particleVertexShaderSource, particleFragmentShaderSource);
 
-    // Compile fragment shader
-    const fragmentShader = this.compileShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
-
-    // Create the master GPU program
-    const program = gl.createProgram();
-    if (!program) {
-      throw new Error('Failed to create WebGL program');
-    }
-
-    // Attach compiled shaders
-    gl.attachShader(program, vertexShader);
-    gl.attachShader(program, fragmentShader);
-
-    // Link the program to the GPU pipeline
-    gl.linkProgram(program);
-
-    // Verify the linking process
-    const linked = gl.getProgramParameter(program, gl.LINK_STATUS);
-    if (!linked) {
-      const infoLog = gl.getProgramInfoLog(program);
-      gl.deleteProgram(program);
-      throw new Error(`Program linking failed: ${infoLog}`);
-    }
-
-    // Instruct the GPU to utilize this program
-    gl.useProgram(program);
-
-    // Immediately detach shaders
-    gl.detachShader(program, vertexShader);
-    gl.detachShader(program, fragmentShader);
-
-    // Delete raw shaders from GPU memory to prevent leaks
-    gl.deleteShader(vertexShader);
-    gl.deleteShader(fragmentShader);
-
-    this.program = program;
+    // Instruct the GPU to utilize the main program
+    gl.useProgram(this.program);
 
     // Extract uniform locations
-    this.brightLoc = gl.getUniformLocation(program, 'u_brightness');
-    this.contrastLoc = gl.getUniformLocation(program, 'u_contrast');
-    this.satLoc = gl.getUniformLocation(program, 'u_saturation');
-    this.lightAngleLoc = gl.getUniformLocation(program, 'u_lightAngle');
-    this.lightIntensityLoc = gl.getUniformLocation(program, 'u_lightIntensity');
-    this.imageLoc = gl.getUniformLocation(program, 'u_image');
-    this.maskLoc = gl.getUniformLocation(program, 'u_mask');
+    this.brightLoc = gl.getUniformLocation(this.program, 'u_brightness');
+    this.contrastLoc = gl.getUniformLocation(this.program, 'u_contrast');
+    this.satLoc = gl.getUniformLocation(this.program, 'u_saturation');
+    this.lightAngleLoc = gl.getUniformLocation(this.program, 'u_lightAngle');
+    this.lightIntensityLoc = gl.getUniformLocation(this.program, 'u_lightIntensity');
+    this.imageLoc = gl.getUniformLocation(this.program, 'u_image');
+    this.maskLoc = gl.getUniformLocation(this.program, 'u_mask');
 
     // Extract attribute locations
-    this.positionLoc = gl.getAttribLocation(program, 'a_position');
-    this.texCoordLoc = gl.getAttribLocation(program, 'a_texCoord');
+    this.positionLoc = gl.getAttribLocation(this.program, 'a_position');
+    this.texCoordLoc = gl.getAttribLocation(this.program, 'a_texCoord');
+
+    // Semantic Feature Bindings
+    this.bgPosLoc = gl.getAttribLocation(this.bgProgram, 'a_position');
+    this.bgColorALoc = gl.getUniformLocation(this.bgProgram, 'u_colorA');
+    this.bgColorBLoc = gl.getUniformLocation(this.bgProgram, 'u_colorB');
+
+    this.particlePosLoc = gl.getAttribLocation(this.particleProgram, 'a_position');
+    this.particleVelLoc = gl.getAttribLocation(this.particleProgram, 'a_velocity');
+    this.particleTimeLoc = gl.getUniformLocation(this.particleProgram, 'u_time');
   }
 
   // ===================== Part 6: Geometry (Screen Quad) =====================
@@ -353,6 +408,18 @@ export class WebGLManager {
     // Enable and configure the texture coordinate attribute
     gl.enableVertexAttribArray(this.texCoordLoc);
     gl.vertexAttribPointer(this.texCoordLoc, 2, gl.FLOAT, false, 0, 0);
+
+    // ----- Particle Buffer -----
+    const particleData = new Float32Array(this.numParticles * 4);
+    for (let i = 0; i < this.numParticles; i++) {
+      particleData[i * 4] = Math.random() * 2 - 1; // x
+      particleData[i * 4 + 1] = Math.random() * 2 - 1; // y
+      particleData[i * 4 + 2] = (Math.random() - 0.5) * 0.5; // vx
+      particleData[i * 4 + 3] = (Math.random() - 0.5) * 0.5; // vy
+    }
+    this.particleBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.particleBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, particleData, gl.STATIC_DRAW);
   }
 
   // ===================== Part 7: Texture Generation =====================
@@ -448,6 +515,22 @@ export class WebGLManager {
     this.updateTexture();
   }
 
+  public enableSemanticBackground(colorHexA: string, colorHexB: string): void {
+    this.semanticBackgroundEnabled = true;
+    this.semanticColors = [this.hexToRgb(colorHexA), this.hexToRgb(colorHexB)];
+    this.needsRender = true;
+  }
+
+  public disableSemanticBackground(): void {
+    this.semanticBackgroundEnabled = false;
+    this.needsRender = true;
+  }
+
+  private hexToRgb(hex: string): number[] {
+    const bigint = parseInt(hex.replace('#', ''), 16);
+    return [((bigint >> 16) & 255) / 255, ((bigint >> 8) & 255) / 255, (bigint & 255) / 255];
+  }
+
   // ===================== Part 8: Dedicated GPU Render Loop =====================
 
   /**
@@ -473,13 +556,43 @@ export class WebGLManager {
     const gl = this.gl;
     if (!gl || !this.program) return;
 
-    if (!this.needsRender) return;
-
-    // Use the filter program
-    gl.useProgram(this.program);
+    if (!this.needsRender && !this.semanticBackgroundEnabled) return;
 
     // Clear the WebGL canvas buffers
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    if (this.semanticBackgroundEnabled && this.bgProgram && this.particleProgram && this.particleBuffer) {
+      // --- 1. Draw Background Gradient ---
+      gl.useProgram(this.bgProgram);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
+      gl.enableVertexAttribArray(this.bgPosLoc);
+      gl.vertexAttribPointer(this.bgPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.uniform3fv(this.bgColorALoc, this.semanticColors[0]);
+      gl.uniform3fv(this.bgColorBLoc, this.semanticColors[1]);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      // --- 2. Draw WebGL Particle Physics ---
+      gl.useProgram(this.particleProgram);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.particleBuffer);
+      gl.enableVertexAttribArray(this.particlePosLoc);
+      gl.enableVertexAttribArray(this.particleVelLoc);
+      gl.vertexAttribPointer(this.particlePosLoc, 2, gl.FLOAT, false, 16, 0);
+      gl.vertexAttribPointer(this.particleVelLoc, 2, gl.FLOAT, false, 16, 8);
+
+      gl.uniform1f(this.particleTimeLoc, (performance.now() - this.startTime) / 1000.0);
+
+      // Additive blending for particles
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+      gl.drawArrays(gl.POINTS, 0, this.numParticles);
+
+      // Reset standard alpha blending for the main image
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    }
+
+    // --- 3. Draw Main Isolated Image ---
+    gl.useProgram(this.program);
 
     // Bind the position buffer
     gl.bindBuffer(gl.ARRAY_BUFFER, this.positionBuffer);
@@ -512,7 +625,7 @@ export class WebGLManager {
     // Execute the final draw command: 6 vertices (2 triangles forming the full-screen quad)
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    this.needsRender = false;
+    this.needsRender = this.semanticBackgroundEnabled; // Maintain particle animation if enabled
   }
 
   /**
@@ -543,6 +656,14 @@ export class WebGLManager {
       gl.deleteProgram(this.program);
       this.program = null;
     }
+    if (this.bgProgram) {
+      gl.deleteProgram(this.bgProgram);
+      this.bgProgram = null;
+    }
+    if (this.particleProgram) {
+      gl.deleteProgram(this.particleProgram);
+      this.particleProgram = null;
+    }
 
     // Delete buffers
     if (this.positionBuffer) {
@@ -552,6 +673,10 @@ export class WebGLManager {
     if (this.texCoordBuffer) {
       gl.deleteBuffer(this.texCoordBuffer);
       this.texCoordBuffer = null;
+    }
+    if (this.particleBuffer) {
+      gl.deleteBuffer(this.particleBuffer);
+      this.particleBuffer = null;
     }
 
     // Delete the texture (frees GPU VRAM)

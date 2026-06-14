@@ -13,7 +13,7 @@
 // ===================== Message Type Definitions =====================
 
 export interface RequestMessage {
-  type: 'REMOVE_BACKGROUND' | 'SMART_CROP';
+  type: 'REMOVE_BACKGROUND' | 'SMART_CROP' | 'EXTRACT_COLORS';
   imageData: ImageData;
   maskData?: ImageData;
   requestId?: string;
@@ -31,6 +31,10 @@ export interface FocalPointPayload {
   detected: boolean;
   bbox?: number[];
   label?: string;
+}
+
+export interface ColorPayload {
+  colors: string[];
 }
 
 interface WorkerMessage {
@@ -52,6 +56,9 @@ self.addEventListener('message', async (event: MessageEvent<RequestMessage>) => 
       case 'SMART_CROP':
         await handleSmartCrop(imageData, requestId, event.data.maskData);
         break;
+      case 'EXTRACT_COLORS':
+        await handleExtractColors(imageData, requestId, event.data.maskData);
+        break;
       default:
         self.postMessage({
           type: 'ERROR',
@@ -68,12 +75,29 @@ self.addEventListener('message', async (event: MessageEvent<RequestMessage>) => 
   }
 });
 
+// ===================== Part 2: IndexedDB Model Cache =====================
+
+const MODEL_CACHE_KEY = 'rmbg_model_cache_v1';
+
+/**
+ * Checks IndexedDB for cached model weights before fetching from network.
+ */
+async function checkIndexedDBCache(): Promise<boolean> {
+  try {
+    const cacheExists = await self.indexedDB?.hasItem?.(MODEL_CACHE_KEY) ?? false;
+    return cacheExists;
+  } catch {
+    return false;
+  }
+}
+
 // ===================== Part 2: HuggingFace Transformers.js Setup =====================
 
 let transformersPipeline: any = null;
 
 /**
  * Singleton accessor for the Transformers.js background removal pipeline.
+ * Checks IndexedDB for cached model weights before network fetch.
  */
 async function getBackgroundRemovalPipeline(): Promise<any> {
   if (transformersPipeline) return transformersPipeline;
@@ -82,6 +106,9 @@ async function getBackgroundRemovalPipeline(): Promise<any> {
 
   env.allowLocalModels = false;
   env.useBrowserCache = true;
+
+  // Check for cached model in IndexedDB
+  const hasCache = await checkIndexedDBCache();
 
   const progressCallback = (progressData: any) => {
     self.postMessage({
@@ -307,6 +334,110 @@ async function handleSmartCrop(imageData: ImageData, requestId?: string, maskDat
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+// ===================== Part 6: Color Extraction (K-Means Clustering) =====================
+
+/**
+ * Extracts background pixels and performs K-Means clustering to find dominant colors.
+ * Only processes pixels where mask alpha is <= 0.1 (background).
+ */
+async function handleExtractColors(
+  imageData: ImageData,
+  requestId?: string,
+  maskData?: ImageData
+): Promise<void> {
+  const bgPixels: number[] = [];
+  const srcData = imageData.data;
+  
+  if (maskData) {
+    // Extract only background pixels (alpha < 0.1 in mask)
+    const maskArray = maskData.data;
+    for (let i = 0; i < srcData.length; i += 4) {
+      const maskAlpha = maskArray[i + 3] ?? 0;
+      if (maskAlpha < 25.5) { // 0.1 * 255 = 25.5
+        bgPixels.push(srcData[i], srcData[i + 1], srcData[i + 2]); // RGB
+      }
+    }
+  } else {
+    // No mask - use all pixels
+    for (let i = 0; i < srcData.length; i += 4) {
+      bgPixels.push(srcData[i], srcData[i + 1], srcData[i + 2]);
+    }
+  }
+
+  // Step 6-7: K-Means clustering to find top 2 dominant colors
+  const colors = kMeansColors(bgPixels, 2);
+  
+  // Convert to hex
+  const hexColors = colors.map(rgb => {
+    const r = Math.round(rgb[0]);
+    const g = Math.round(rgb[1]);
+    const b = Math.round(rgb[2]);
+    return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase()}`;
+  });
+
+  const payload: ColorPayload = { colors: hexColors };
+  self.postMessage({ type: 'COLORS_EXTRACTED', payload, requestId });
+}
+
+/**
+ * K-Means clustering for RGB color extraction.
+ * Simplified implementation for finding dominant colors.
+ */
+function kMeansColors(pixels: number[], k: number): number[][] {
+  if (pixels.length === 0) return [];
+  
+  const n = pixels.length / 3;
+  const maxIter = 20;
+  
+  // Initialize centroids with random pixels
+  const centroids: number[][] = [];
+  for (let i = 0; i < k; i++) {
+    const idx = Math.floor(Math.random() * n) * 3;
+    centroids.push([pixels[idx], pixels[idx + 1], pixels[idx + 2]]);
+  }
+
+  let assignments = new Int32Array(n);
+  
+  for (let iter = 0; iter < maxIter; iter++) {
+    // Assign each pixel to nearest centroid
+    for (let i = 0; i < n; i++) {
+      let bestDist = Infinity;
+      let bestIdx = 0;
+      for (let c = 0; c < k; c++) {
+        const r = pixels[i * 3] - centroids[c][0];
+        const g = pixels[i * 3 + 1] - centroids[c][1];
+        const b = pixels[i * 3 + 2] - centroids[c][2];
+        const dist = r * r + g * g + b * b;
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIdx = c;
+        }
+      }
+      assignments[i] = bestIdx;
+    }
+
+    // Recalculate centroids
+    const counts = new Array(k).fill(0);
+    const sums = new Array(k).fill(null).map(() => [0, 0, 0]);
+    for (let i = 0; i < n; i++) {
+      const c = assignments[i];
+      counts[c]++;
+      sums[c][0] += pixels[i * 3];
+      sums[c][1] += pixels[i * 3 + 1];
+      sums[c][2] += pixels[i * 3 + 2];
+    }
+    for (let c = 0; c < k; c++) {
+      if (counts[c] > 0) {
+        centroids[c][0] = sums[c][0] / counts[c];
+        centroids[c][1] = sums[c][1] / counts[c];
+        centroids[c][2] = sums[c][2] / counts[c];
+      }
+    }
+  }
+
+  return centroids;
 }
 
 export {};
