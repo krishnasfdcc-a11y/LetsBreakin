@@ -96,15 +96,16 @@ async function getBackgroundRemovalPipeline(): Promise<any> {
       payload: {
         status: progressData.status || 'loading',
         percentage: progressData.progress || 0,
-        model: 'RMBG-1.4',
+        model: 'MODNet',
       },
     };
     self.postMessage(msg);
   };
 
   // Initialize the image segmentation pipeline with progress tracking
-  // @huggingface/transformers v3 natively supports briaai/RMBG-1.4 (SegformerForSemanticSegmentation)
-  transformersPipeline = await pipeline('image-segmentation', 'briaai/RMBG-1.4', {
+  // Using Xenova/modnet - a lightweight background removal model
+  // optimized for web environments that is natively supported by this Transformers.js version
+  transformersPipeline = await pipeline('image-segmentation', 'Xenova/modnet', {
     progress_callback: progressCallback,
   });
 
@@ -114,7 +115,7 @@ async function getBackgroundRemovalPipeline(): Promise<any> {
     payload: {
       status: 'ready',
       percentage: 100,
-      model: 'RMBG-1.4',
+      model: 'MODNet',
     },
   });
 
