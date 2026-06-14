@@ -1,0 +1,30 @@
+{
+  "name": "letsbreakin",
+  "version": "1.0.0",
+  "description": "Hybrid Image Editor - React/Vue UI + Vanilla TypeScript Canvas Core + Web Workers",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "localforage": "^1.10.0",
+    "@tensorflow/tfjs": "^4.15.0",
+    "@tensorflow-models/coco-ssd": "^2.2.3",
+    "@xenova/transformers": "^2.17.0",
+    "heic2any": "^0.0.4"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.2.1",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.8",
+    "vite-plugin-wasm": "^3.3.0",
+    "vite-plugin-top-level-await": "^1.4.1"
+  }
+}
