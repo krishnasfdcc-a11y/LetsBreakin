@@ -1,34 +1,66 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { CanvasManager } from '../core/CanvasManager';
+import { WebGLManager } from '../core/WebGLManager';
 import { validateFile, readFileAsArrayBuffer } from '../utils/fileValidation';
 import './ImageEditor.css';
 
 const ImageEditor: React.FC = () => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const phase1CanvasRef = useRef<HTMLCanvasElement>(null);
+  const webglCanvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
   const canvasManagerRef = useRef<CanvasManager | null>(null);
+  const webglManagerRef = useRef<WebGLManager | null>(null);
   const workerRef = useRef<Worker | null>(null);
+
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasImage, setHasImage] = useState(false);
 
+  // Local display values for the sliders (read-only display, not used for rendering)
+  const [displayBrightness, setDisplayBrightness] = useState(0);
+  const [displayContrast, setDisplayContrast] = useState(1);
+  const [displaySaturation, setDisplaySaturation] = useState(1);
+
+  // Refs to store the WebGL manager ref for slider callbacks
+  const webglRef = useRef<WebGLManager | null>(null);
+
   /**
-   * Initialize the CanvasManager when the canvas mounts.
+   * Initialize the CanvasManager and WebGLManager when canvases mount.
    */
   useEffect(() => {
-    if (canvasRef.current && !canvasManagerRef.current) {
-      canvasManagerRef.current = new CanvasManager(canvasRef.current);
-      canvasManagerRef.current.onImageReady = () => {
+    if (phase1CanvasRef.current && webglCanvasRef.current && !canvasManagerRef.current) {
+      // Phase 1: CanvasManager for CPU transformations (offscreen buffer)
+      const cm = new CanvasManager(phase1CanvasRef.current);
+      canvasManagerRef.current = cm;
+
+      // Phase 2: WebGLManager for GPU filter pipeline
+      const wm = new WebGLManager(phase1CanvasRef.current, webglCanvasRef.current);
+      webglManagerRef.current = wm;
+      webglRef.current = wm;
+
+      // Bridge Phase 1 -> Phase 2: After every Phase 1 render, refresh the WebGL texture
+      cm.onPostRender = () => {
+        wm.updateTexture();
+      };
+
+      cm.onImageReady = () => {
         setHasImage(true);
         setIsLoading(false);
+        // Initial texture upload to WebGL
+        wm.updateTexture();
       };
     }
 
     return () => {
-      // Cleanup worker and canvas manager on unmount
       if (workerRef.current) {
         workerRef.current.terminate();
         workerRef.current = null;
+      }
+      if (webglManagerRef.current) {
+        webglManagerRef.current.destroy();
+        webglManagerRef.current = null;
       }
       if (canvasManagerRef.current) {
         canvasManagerRef.current.destroy();
@@ -38,20 +70,23 @@ const ImageEditor: React.FC = () => {
   }, []);
 
   /**
-   * Handle window resize to keep canvas dimensions in sync.
+   * ResizeObserver to keep both canvases in sync with the container.
    */
   useEffect(() => {
-    const handleResize = () => {
-      canvasManagerRef.current?.handleResize();
-    };
+    const container = canvasContainerRef.current;
+    if (!container) return;
 
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
+    const resizeObserver = new ResizeObserver(() => {
+      canvasManagerRef.current?.handleResize();
+      webglManagerRef.current?.handleResize();
+    });
+
+    resizeObserver.observe(container);
+    return () => resizeObserver.disconnect();
   }, []);
 
   /**
    * Processes a loaded image Blob from either direct file upload or HEIC decoding.
-   * Creates an Object URL and passes it to the CanvasManager.
    */
   const processImageBlob = useCallback((blob: Blob) => {
     const imageUrl = URL.createObjectURL(blob);
@@ -60,19 +95,15 @@ const ImageEditor: React.FC = () => {
 
   /**
    * Handles file selection from the hidden input.
-   * Validates the file, then either processes directly (PNG/JPEG) or
-   * sends to the Web Worker for HEIC decoding.
    */
   const handleFileSelect = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    // Reset states
     setError(null);
     setIsLoading(true);
     setHasImage(false);
 
-    // Validate the file
     const validation = await validateFile(file);
     if (!validation.valid) {
       setError(validation.error || 'Invalid file');
@@ -90,17 +121,14 @@ const ImageEditor: React.FC = () => {
 
     // For HEIC/HEIF files, use the Web Worker for decoding
     try {
-      // Convert file to ArrayBuffer for transfer to worker
       const arrayBuffer = await readFileAsArrayBuffer(file);
 
-      // Create worker if not already created
       if (!workerRef.current) {
         workerRef.current = new Worker(
           new URL('../workers/heicDecoder.worker.ts', import.meta.url),
           { type: 'module' }
         );
 
-        // Set up worker message handler
         workerRef.current.onmessage = (e: MessageEvent) => {
           const { blob, error: workerError } = e.data;
 
@@ -114,7 +142,6 @@ const ImageEditor: React.FC = () => {
             processImageBlob(blob);
           }
 
-          // Terminate worker immediately to free up CPU resources
           if (workerRef.current) {
             workerRef.current.terminate();
             workerRef.current = null;
@@ -131,7 +158,6 @@ const ImageEditor: React.FC = () => {
         };
       }
 
-      // Send the ArrayBuffer to the worker using Transferable Objects (zero-copy)
       workerRef.current.postMessage({ buffer: arrayBuffer }, [arrayBuffer]);
     } catch (err) {
       setError(`Failed to process HEIC file: ${err instanceof Error ? err.message : 'Unknown error'}`);
@@ -150,12 +176,57 @@ const ImageEditor: React.FC = () => {
    * Fit the image to the canvas viewport.
    */
   const handleFitToScreen = useCallback(() => {
-    const manager = canvasManagerRef.current;
-    if (!manager || !canvasRef.current) return;
+    canvasManagerRef.current?.resetState();
+    canvasManagerRef.current?.setZoom(1);
+  }, []);
 
-    // Reset state and let the canvas manager recalculate
-    manager.resetState();
-    manager.setZoom(1);
+  // ===== Filter Slider Handlers (Direct GPU State Bypass) =====
+  //
+  // These handlers bypass React's setState for the rendering path.
+  // They update the WebGLManager's plain JS object directly,
+  // avoiding component re-renders on every slider movement.
+  // Local display values are only used for the readout display.
+
+  const handleBrightnessChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseFloat(e.target.value);
+    if (webglRef.current) {
+      webglRef.current.filterState.brightness = value;
+      webglRef.current.requestRender();
+    }
+    setDisplayBrightness(value);
+  }, []);
+
+  const handleContrastChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseFloat(e.target.value);
+    if (webglRef.current) {
+      webglRef.current.filterState.contrast = value;
+      webglRef.current.requestRender();
+    }
+    setDisplayContrast(value);
+  }, []);
+
+  const handleSaturationChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseFloat(e.target.value);
+    if (webglRef.current) {
+      webglRef.current.filterState.saturation = value;
+      webglRef.current.requestRender();
+    }
+    setDisplaySaturation(value);
+  }, []);
+
+  /**
+   * Reset all filters to their default values.
+   */
+  const handleResetFilters = useCallback(() => {
+    if (webglRef.current) {
+      webglRef.current.filterState.brightness = 0;
+      webglRef.current.filterState.contrast = 1;
+      webglRef.current.filterState.saturation = 1;
+      webglRef.current.requestRender();
+    }
+    setDisplayBrightness(0);
+    setDisplayContrast(1);
+    setDisplaySaturation(1);
   }, []);
 
   return (
@@ -199,14 +270,22 @@ const ImageEditor: React.FC = () => {
         </div>
       )}
 
-      {/* Canvas viewport */}
-      <div className="viewport">
+      {/* Dual-canvas viewport */}
+      <div className="canvas-container" ref={canvasContainerRef}>
+        {/* Phase 1 canvas - offscreen, opacity: 0, handles user interactions */}
         <canvas
-          ref={canvasRef}
+          ref={phase1CanvasRef}
           id="main-viewport"
           className="main-canvas"
         />
 
+        {/* WebGL canvas - visible output, receives GPU-filtered result */}
+        <canvas
+          ref={webglCanvasRef}
+          id="webgl-viewport"
+        />
+
+        {/* Empty state (shown when no image is loaded) */}
         {!hasImage && !isLoading && !error && (
           <div className="empty-state" onClick={handleUploadClick}>
             <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -219,6 +298,61 @@ const ImageEditor: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Filter controls bar (only when image is loaded) */}
+      {hasImage && (
+        <div className="filter-bar">
+          <div className="filter-group">
+            <span className="filter-label">Brightness</span>
+            <input
+              type="range"
+              className="filter-slider"
+              min="-1"
+              max="1"
+              step="0.01"
+              value={displayBrightness}
+              onChange={handleBrightnessChange}
+            />
+            <span className="filter-value">{displayBrightness.toFixed(2)}</span>
+          </div>
+
+          <div className="filter-group">
+            <span className="filter-label">Contrast</span>
+            <input
+              type="range"
+              className="filter-slider"
+              min="0"
+              max="3"
+              step="0.01"
+              value={displayContrast}
+              onChange={handleContrastChange}
+            />
+            <span className="filter-value">{displayContrast.toFixed(2)}</span>
+          </div>
+
+          <div className="filter-group">
+            <span className="filter-label">Saturation</span>
+            <input
+              type="range"
+              className="filter-slider"
+              min="0"
+              max="3"
+              step="0.01"
+              value={displaySaturation}
+              onChange={handleSaturationChange}
+            />
+            <span className="filter-value">{displaySaturation.toFixed(2)}</span>
+          </div>
+
+          <button className="filter-reset" onClick={handleResetFilters} title="Reset filters">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <polyline points="1 4 1 10 7 10" />
+              <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+            </svg>
+            Reset
+          </button>
+        </div>
+      )}
 
       {/* Hidden file input */}
       <input

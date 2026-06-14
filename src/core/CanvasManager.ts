@@ -42,7 +42,7 @@ export const ZOOM_MIN = 0.1;
 export const ZOOM_MAX = 10.0;
 
 export class CanvasManager {
-  private canvas: HTMLCanvasElement;
+  public canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private image: HTMLImageElement;
   private state: CanvasState;
@@ -55,6 +55,12 @@ export class CanvasManager {
    * Callback fired when the image is loaded and ready for rendering.
    */
   public onImageReady: (() => void) | null = null;
+
+  /**
+   * Callback fired after every render pass to notify the WebGL pipeline
+   * that the texture needs to be refreshed from the Phase 1 canvas.
+   */
+  public onPostRender: (() => void) | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -132,10 +138,10 @@ export class CanvasManager {
     this.canvas.style.height = `${rect.height}px`;
 
     // Scale the context to account for device pixel ratio
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0); // Reset transform first
     this.ctx.scale(dpr, dpr);
 
     // Reset canvas dimensions stored for rendering calculations
-    // We'll store the CSS dimensions for coordinate calculations
     (this.canvas as any)._cssWidth = rect.width;
     (this.canvas as any)._cssHeight = rect.height;
 
@@ -206,6 +212,9 @@ export class CanvasManager {
     ctx.restore();
 
     this.needsRender = false;
+
+    // Notify the WebGL pipeline to refresh its texture from this canvas
+    this.onPostRender?.();
   }
 
   /**

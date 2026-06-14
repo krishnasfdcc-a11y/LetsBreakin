@@ -17,6 +17,7 @@
   border-bottom: 1px solid #3a3a3a;
   min-height: 48px;
   z-index: 10;
+  flex-shrink: 0;
 }
 
 .toolbar-button {
@@ -107,18 +108,49 @@
   line-height: 1;
 }
 
-/* Viewport */
+/* Dual-canvas container */
+.canvas-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* Phase 1 canvas - offscreen memory buffer for transformations */
+#main-viewport {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  opacity: 0;
+  pointer-events: auto;
+  cursor: grab;
+}
+
+#main-viewport:active {
+  cursor: grabbing;
+}
+
+/* WebGL canvas - sits above, samples Phase 1 as a texture */
+#webgl-viewport {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2;
+  pointer-events: none;
+  display: block;
+}
+
+/* Viewport (legacy - kept for empty state positioning) */
 .viewport {
   flex: 1;
   position: relative;
   overflow: hidden;
-  cursor: grab;
-}
-
-.main-canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
 }
 
 /* Empty state */
@@ -133,6 +165,7 @@
   color: #666;
   cursor: pointer;
   transition: color 0.15s ease;
+  z-index: 3;
 }
 
 .empty-state:hover {
@@ -151,4 +184,98 @@
 .empty-state p {
   font-size: 14px;
   opacity: 0.7;
+}
+
+/* ===== Filter Controls Bar ===== */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: #222;
+  border-top: 1px solid #3a3a3a;
+  flex-shrink: 0;
+  min-height: 44px;
+}
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  max-width: 280px;
+}
+
+.filter-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: #999;
+  min-width: 70px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.filter-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 4px;
+  background: #444;
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.filter-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  background: #1a6dff;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid #222;
+  transition: transform 0.1s ease;
+}
+
+.filter-slider::-webkit-slider-thumb:hover {
+  transform: scale(1.2);
+}
+
+.filter-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  background: #1a6dff;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid #222;
+}
+
+.filter-value {
+  font-size: 13px;
+  color: #ccc;
+  min-width: 36px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Reset button */
+.filter-reset {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: #3a3a3a;
+  border: 1px solid #4a4a4a;
+  border-radius: 4px;
+  color: #aaa;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+  white-space: nowrap;
+}
+
+.filter-reset:hover {
+  background: #4a4a4a;
+  color: #e0e0e0;
 }
