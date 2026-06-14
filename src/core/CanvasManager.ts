@@ -32,7 +32,6 @@ export class CanvasManager {
   private ctx2D: CanvasRenderingContext2D;
 
   /** The WebGL overlay canvas (foreground, handles filters). */
-  private canvasGL: HTMLCanvasElement;
   private webGLFilter: WebGLFilter;
 
   /** The currently loaded source image. */
@@ -101,7 +100,6 @@ export class CanvasManager {
     cgl.style.height = '100%';
     cgl.style.pointerEvents = 'none'; // let 2D canvas receive mouse events
     container.appendChild(cgl);
-    this.canvasGL = cgl;
     this.webGLFilter = new WebGLFilter(cgl);
 
     // ── Listen to history changes ────────────────────────────
@@ -568,8 +566,6 @@ export class CanvasManager {
       const focalY = bbox.y + bbox.height / 2;
 
       // Calculate translation to centre the focal point in the viewport
-      const vw = this.canvas2D.width;
-      const vh = this.canvas2D.height;
       const imgCenterX = this.img.width / 2;
       const imgCenterY = this.img.height / 2;
 

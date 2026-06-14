@@ -119,10 +119,6 @@ export async function exportFullResolution(
   const scaleFactorY = srcH / viewportH;
   const scaleFactor = Math.max(scaleFactorX, scaleFactorY);
 
-  // Calculate viewport offset in source pixels
-  const centerX = viewportW / 2;
-  const centerY = viewportH / 2;
-
   // Build the transform for full-resolution export
   // This mirrors the CanvasManager.drawTransformedImage() logic
   // but at native resolution.

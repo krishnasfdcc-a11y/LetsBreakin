@@ -98,19 +98,7 @@ function loadImage(url: string): Promise<HTMLImageElement> {
         ctx.drawImage(bitmap, 0, 0);
         const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
 
-        // Create a synthetic object that mimics an HTMLImageElement
-        // with the properties TFJS needs: width, height, and a data
-        // property (though detect() can accept ImageData directly).
-        const fakeImg = {
-          width: bitmap.width,
-          height: bitmap.height,
-          // Add a tag so TFJS knows what it is (it checks .tagName)
-          tagName: 'IMG',
-        } as unknown as HTMLImageElement;
-
-        // Actually TFJS COCO-SSD's detect() accepts ImageData directly,
-        // but we need to resolve with an ImageData-compatible object.
-        // Let's resolve with the ImageData since TFJS supports it.
+        // TFJS COCO-SSD's detect() accepts ImageData directly as input.
         resolve(imageData as unknown as HTMLImageElement);
       })
       .catch(reject);
