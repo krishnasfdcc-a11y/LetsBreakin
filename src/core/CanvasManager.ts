@@ -1,683 +1,419 @@
-// src/core/CanvasManager.ts
 /**
- * CanvasManager – Central orchestration class for the entire editor.
+ * CanvasManager - Hardware-accelerated 2D rendering engine for image manipulation.
  *
- * Phase 1: Image ingestion (2D canvas preview + HEIC decoding)
- * Phase 2: WebGL-accelerated filter pipeline
- * Phase 3: AI background removal & smart auto-crop
- * Phase 4: History, persistence & export
+ * Manages canvas state, transformation matrices, and rendering loops.
+ * All transformations are applied through the 2D context matrix stack for
+ * optimal GPU-accelerated performance.
+ *
+ * State matrix properties:
+ * - zoom: Scale factor (0.1 - 10.0)
+ * - translateX/Y: Panning offsets in canvas coordinates
+ * - rotation: Angular rotation in degrees
+ * - flipX/Y: Mirror transformations
  */
 
-import { HistoryManager } from './HistoryManager';
-import { WebGLFilter } from './WebGLFilter';
-import { ProjectStore } from './ProjectStore';
-import { exportFullResolution, triggerDownload } from './ExportEngine';
-import type { TransformState, FilterUniforms, HistoryEntry } from './types';
-
-export type { TransformState, FilterUniforms, HistoryEntry };
-
-export interface CanvasManagerCallbacks {
-  onStateChange?: () => void;
-  onHistoryChange?: () => void;
-  onAITaskStart?: (task: 'mask' | 'crop') => void;
-  onAITaskEnd?: (task: 'mask' | 'crop') => void;
-  onExportComplete?: (url: string) => void;
-  onError?: (msg: string) => void;
+export interface CanvasState {
+  zoom: number;
+  translateX: number;
+  translateY: number;
+  rotation: number;
+  flipX: boolean;
+  flipY: boolean;
 }
 
+export interface PointerState {
+  isDragging: boolean;
+  startX: number;
+  startY: number;
+  lastTranslateX: number;
+  lastTranslateY: number;
+}
+
+export const DEFAULT_STATE: CanvasState = {
+  zoom: 1,
+  translateX: 0,
+  translateY: 0,
+  rotation: 0,
+  flipX: false,
+  flipY: false,
+};
+
+export const ZOOM_MIN = 0.1;
+export const ZOOM_MAX = 10.0;
+
 export class CanvasManager {
-  /* ─── canvas elements ─────────────────────────────────────── */
-  /** The 2D preview canvas (background layer, used for position/pan). */
-  private canvas2D: HTMLCanvasElement;
-  private ctx2D: CanvasRenderingContext2D;
+  private canvas: HTMLCanvasElement;
+  private ctx: CanvasRenderingContext2D;
+  private image: HTMLImageElement;
+  private state: CanvasState;
+  private pointer: PointerState;
+  private animationFrameId: number | null = null;
+  private needsRender: boolean = false;
+  private currentImageUrl: string | null = null;
 
-  /** Offscreen canvas for 2D transformations before WebGL. */
-  private offscreenCanvas: OffscreenCanvas;
-  private offscreenCtx: OffscreenCanvasRenderingContext2D;
+  /**
+   * Callback fired when the image is loaded and ready for rendering.
+   */
+  public onImageReady: (() => void) | null = null;
 
-  /** The WebGL overlay canvas (foreground, handles filters). */
-  private webGLFilter: WebGLFilter;
+  constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d')!;
+    this.image = new Image();
+    this.state = { ...DEFAULT_STATE };
+    this.pointer = {
+      isDragging: false,
+      startX: 0,
+      startY: 0,
+      lastTranslateX: 0,
+      lastTranslateY: 0,
+    };
 
-  /** The currently loaded source image. */
-  private img: HTMLImageElement | null = null;
-  private imgUrl: string | null = null; // object URL
-
-  /* ─── workers ─────────────────────────────────────────────── */
-  private decoderWorker: Worker | null = null;
-  private aiWorker: Worker | null = null;
-  private autoCropWorker: Worker | null = null;
-
-  /* ─── state ───────────────────────────────────────────────── */
-  public state: TransformState = {
-    zoom: 1,
-    translateX: 0,
-    translateY: 0,
-    rotation: 0,
-    flipX: false,
-    flipY: false,
-  };
-
-  /** Current filter values (read by WebGLFilter every frame). */
-  public filterUniforms: FilterUniforms = {
-    brightness: 0,
-    contrast: 1,
-    saturation: 1,
-  };
-
-  /** History engine. */
-  public history = new HistoryManager();
-
-  /** AI mask ImageData (null if no mask applied). */
-  private maskData: ImageData | null = null;
-
-  /** Whether a mask has been applied (canvas compositing). */
-  private maskActive = false;
-
-  /** Callbacks. */
-  private callbacks: CanvasManagerCallbacks = {};
-
-  /** Cached object URL for the original blob (for persistence). */
-  private originalBlobUrl: string | null = null;
-
-  constructor(container: HTMLElement, callbacks?: CanvasManagerCallbacks) {
-    this.callbacks = callbacks ?? {};
-
-    // ── Create 2D canvas (background/positioning layer) ──────
-    const c2d = document.createElement('canvas');
-    c2d.style.position = 'absolute';
-    c2d.style.top = '0';
-    c2d.style.left = '0';
-    c2d.style.width = '100%';
-    c2d.style.height = '100%';
-    container.appendChild(c2d);
-    this.canvas2D = c2d;
-    const ctx = c2d.getContext('2d');
-    if (!ctx) throw new Error('2D context not supported');
-    this.ctx2D = ctx;
-
-    // Create offscreen canvas
-    this.offscreenCanvas = new OffscreenCanvas(c2d.width, c2d.height);
-    const offscreenCtx = this.offscreenCanvas.getContext('2d');
-    if (!offscreenCtx) throw new Error('Offscreen 2D context not supported');
-    this.offscreenCtx = offscreenCtx;
-
-    // ── Create WebGL canvas (filter/fx layer) ─────────────────
-    const cgl = document.createElement('canvas');
-    cgl.style.position = 'absolute';
-    cgl.style.top = '0';
-    cgl.style.left = '0';
-    cgl.style.width = '100%';
-    cgl.style.height = '100%';
-    cgl.style.pointerEvents = 'none'; // let 2D canvas receive mouse events
-    container.appendChild(cgl);
-    this.webGLFilter = new WebGLFilter(cgl);
-
-    // ── Listen to history changes ────────────────────────────
-    this.history.onChange(() => {
-      this.callbacks.onHistoryChange?.();
-    });
-
-    // ── Start 2D render loop ─────────────────────────────────
-    requestAnimationFrame(() => this.renderLoop2D());
-
-    // ── Mouse / touch panning ────────────────────────────────
-    this.setupPanHandlers();
-
-    // ── Attempt to restore previous session ──────────────────
-    this.restoreSession();
+    this.setupEventListeners();
+    this.handleResize();
   }
 
-  /* ================================================================
-   *  PUBLIC API — INGESTION
-   * ================================================================ */
-
-  /** Load an image file.  HEIC is decoded via worker. */
-  async loadFile(file: File): Promise<void> {
-    // Revoke previous URLs
-    this.revokeUrls();
-
-    const isHeic = /\.heic$/i.test(file.name) || file.type === 'image/heic';
-
-    if (isHeic) {
-      if (!this.decoderWorker) {
-        this.decoderWorker = new Worker(
-          new URL('./DecoderWorker.ts', import.meta.url),
-          { type: 'module' },
-        );
-        this.decoderWorker.onmessage = (e) => this.handleDecoderMessage(e);
-      }
-
-      const buffer = await file.arrayBuffer();
-      // Transfer the buffer (zero-copy)
-      this.decoderWorker.postMessage({ buffer }, [buffer]);
-    } else {
-      this.imgUrl = URL.createObjectURL(file);
-      this.originalBlobUrl = this.imgUrl;
-      await this.loadImageFromUrl(this.imgUrl);
-      this.webGLFilter.updateTexture(this.img!);
-
-      // Push history entry
-      this.history.push(HistoryManager.ingestImage(this.imgUrl, { ...this.state }));
-
-      // Persist
-      this.saveSession();
-    }
-  }
-
-  /* ================================================================
-   *  PUBLIC API — TRANSFORMS
-   * ================================================================ */
-
-  setZoom(zoom: number): void {
-    this.state.zoom = Math.max(0.1, Math.min(10, zoom));
-    this.history.push(HistoryManager.setZoom(zoom, { ...this.state }));
-    this.clampPan();
-  }
-
-  setRotation(deg: number): void {
-    this.state.rotation = ((deg % 360) + 360) % 360;
-    this.history.push(HistoryManager.setRotation(deg, { ...this.state }));
-    this.clampPan();
-  }
-
-  setFlipX(flag: boolean): void {
-    this.state.flipX = flag;
-    this.history.push(HistoryManager.setFlip(this.state.flipX, this.state.flipY, { ...this.state }));
-  }
-
-  setFlipY(flag: boolean): void {
-    this.state.flipY = flag;
-    this.history.push(HistoryManager.setFlip(this.state.flipX, this.state.flipY, { ...this.state }));
-  }
-
-  pan(dx: number, dy: number): void {
-    this.state.translateX += dx;
-    this.state.translateY += dy;
-    this.clampPan();
-  }
-
-  /* ================================================================
-   *  PUBLIC API — FILTERS  (writes directly to WebGL uniform object)
-   * ================================================================ */
-
-  setBrightness(v: number): void {
-    this.filterUniforms.brightness = Math.max(-1, Math.min(1, v));
-  }
-  setContrast(v: number): void {
-    this.filterUniforms.contrast = Math.max(0, Math.min(3, v));
-  }
-  setSaturation(v: number): void {
-    this.filterUniforms.saturation = Math.max(0, Math.min(3, v));
-  }
-  setFilter(uniforms: Partial<FilterUniforms>): void {
-    if (uniforms.brightness !== undefined) this.setBrightness(uniforms.brightness);
-    if (uniforms.contrast !== undefined) this.setContrast(uniforms.contrast);
-    if (uniforms.saturation !== undefined) this.setSaturation(uniforms.saturation);
-    // Push history snapshot
-    this.history.push(
-      HistoryManager.setFilter({ ...this.filterUniforms }, { ...this.state }),
-    );
-  }
-
-  /* ================================================================
-   *  PUBLIC API — AI FEATURES
-   * ================================================================ */
-
-  /** Request AI background removal. */
-  async applyAIBackgroundRemoval(): Promise<void> {
-    if (!this.img) return;
-    this.callbacks.onAITaskStart?.('mask');
-
-    try {
-      if (!this.aiWorker) {
-        this.aiWorker = new Worker(new URL('./AIWorker.ts', import.meta.url), {
-          type: 'module',
-        });
-        this.aiWorker.onmessage = (e) => this.handleAIWorkerMessage(e);
-      }
-
-      // Get current pixel data from 2D canvas
-      const w = this.canvas2D.width;
-      const h = this.canvas2D.height;
-      const imageData = this.ctx2D.getImageData(0, 0, w, h);
-
-      this.aiWorker.postMessage({ type: 'AI_MASK_REQUEST', imageData });
-    } catch (err) {
-      this.callbacks.onAITaskEnd?.('mask');
-      this.callbacks.onError?.(
-        err instanceof Error ? err.message : 'AI masking failed',
-      );
-    }
-  }
-
-  /** Request smart auto-crop based on subject detection. */
-  async requestAutoCrop(): Promise<void> {
-    if (!this.img || !this.imgUrl) return;
-    this.callbacks.onAITaskStart?.('crop');
-
-    try {
-      if (!this.autoCropWorker) {
-        this.autoCropWorker = new Worker(
-          new URL('./AutoCropWorker.ts', import.meta.url),
-          { type: 'module' },
-        );
-        this.autoCropWorker.onmessage = (e) => this.handleAutoCropMessage(e);
-      }
-
-      this.autoCropWorker.postMessage({
-        type: 'AUTO_CROP_REQUEST',
-        imageUrl: this.imgUrl,
-      });
-    } catch (err) {
-      this.callbacks.onAITaskEnd?.('crop');
-      this.callbacks.onError?.(
-        err instanceof Error ? err.message : 'Auto-crop failed',
-      );
-    }
-  }
-
-  /* ================================================================
-   *  PUBLIC API — HISTORY
-   * ================================================================ */
-
-  undo(): void {
-    if (!this.history.canUndo()) return;
-    this.history.undo();
-    this.replayHistory();
-  }
-
-  redo(): void {
-    if (!this.history.canRedo()) return;
-    this.history.redo();
-    this.replayHistory();
-  }
-
-  /* ================================================================
-   *  PUBLIC API — EXPORT
-   * ================================================================ */
-
-  async export(format: 'image/png' | 'image/webp' = 'image/png'): Promise<void> {
-    if (!this.img) return;
-
-    try {
-      const url = await exportFullResolution(
-        this.img,
-        this.history.getAll(),
-        this.canvas2D.width,
-        this.canvas2D.height,
-        { format },
-        this.maskActive ? this.maskData : null
-      );
-
-      triggerDownload(url, `edited-masterpiece.${format === 'image/png' ? 'png' : 'webp'}`);
-      // Revoke after a short delay to allow download
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-
-      this.callbacks.onExportComplete?.(url);
-    } catch (err) {
-      this.callbacks.onError?.(
-        err instanceof Error ? err.message : 'Export failed',
-      );
-    }
-  }
-
-  /* ================================================================
-   *  PUBLIC API — PERSISTENCE
-   * ================================================================ */
-
-  async saveSession(): Promise<void> {
-    if (!this.imgUrl) return;
-    try {
-      // Fetch the current blob from the object URL
-      const res = await fetch(this.imgUrl);
-      const blob = await res.blob();
-
-      await ProjectStore.save({
-        assetBlob: blob,
-        assetType: blob.type || 'image/png',
-        historyJSON: this.history.toJSON(),
-        transformState: { ...this.state },
-        filterState: { ...this.filterUniforms },
-      });
-    } catch {
-      // Persistence is best-effort (e.g. cross-origin blob may fail fetch)
-    }
-  }
-
-  async restoreSession(): Promise<void> {
-    try {
-      const snapshot = await ProjectStore.load();
-      if (!snapshot || !snapshot.assetBlob) return;
-
-      this.revokeUrls();
-      this.imgUrl = URL.createObjectURL(snapshot.assetBlob);
-      await this.loadImageFromUrl(this.imgUrl);
-
-      if (snapshot.transformState) this.state = snapshot.transformState;
-      if (snapshot.filterState) {
-        this.filterUniforms = snapshot.filterState;
-        // Sync to WebGL uniform object
-        this.webGLFilter.uniforms.brightness = snapshot.filterState.brightness;
-        this.webGLFilter.uniforms.contrast = snapshot.filterState.contrast;
-        this.webGLFilter.uniforms.saturation = snapshot.filterState.saturation;
-      }
-      if (snapshot.historyJSON) this.history.fromJSON(snapshot.historyJSON);
-
-      this.callbacks.onStateChange?.();
-      this.callbacks.onHistoryChange?.();
-    } catch {
-      // Session restore is best-effort
-    }
-  }
-
-  /* ================================================================
-   *  CLEANUP
-   * ================================================================ */
-
-  dispose(): void {
-    this.webGLFilter.dispose();
-    this.decoderWorker?.terminate();
-    this.aiWorker?.terminate();
-    this.autoCropWorker?.terminate();
-    this.revokeUrls();
-  }
-
-  resize(width: number, height: number): void {
-    this.canvas2D.width = width;
-    this.canvas2D.height = height;
-    this.offscreenCanvas.width = width;
-    this.offscreenCanvas.height = height;
-    this.webGLFilter.resize(width, height);
-    // Re-clamp pan after resize
-    this.clampPan();
-  }
-
-  getElement(): HTMLCanvasElement {
-    return this.canvas2D;
-  }
-
-  /** Whether an image is currently loaded. */
-  get hasImage(): boolean {
-    return this.img !== null;
-  }
-
-  /* ================================================================
-   *  INTERNAL — Render Loops
-   * ================================================================ */
-
-  /** Rendering loop – runs via requestAnimationFrame */
-  private renderLoop2D(): void {
-    // Clear both canvases
-    this.ctx2D.clearRect(0, 0, this.canvas2D.width, this.canvas2D.height);
-    this.offscreenCtx.clearRect(0, 0, this.offscreenCanvas.width, this.offscreenCanvas.height);
-
-    if (this.img) {
-      this.drawTransformedImage();
-      this.webGLFilter.updateTexture(this.offscreenCanvas);
+  /**
+   * Sets the image source from an Object URL and triggers loading.
+   * Revokes the previous Object URL to prevent memory leaks.
+   */
+  public setImageSource(imageUrl: string): void {
+    // Revoke the previous Object URL to prevent RAM leaks
+    if (this.currentImageUrl) {
+      URL.revokeObjectURL(this.currentImageUrl);
     }
 
-    requestAnimationFrame(() => this.renderLoop2D());
+    this.currentImageUrl = imageUrl;
+    this.resetState();
+
+    // Set up the onload handler before setting src
+    this.image.onload = () => {
+      this.handleResize();
+      this.needsRender = true;
+      this.scheduleRender();
+      this.onImageReady?.();
+    };
+
+    this.image.onerror = () => {
+      console.error('Failed to load image from the provided URL');
+    };
+
+    this.image.src = imageUrl;
   }
 
-  private drawTransformedImage(): void {
-    if (!this.img) return;
-    const { zoom, translateX, translateY, rotation, flipX, flipY } = this.state;
-    const { width, height } = this.img;
-    const ctx = this.offscreenCtx; // <--- Draw to offscreen context
-    const vw = this.canvas2D.width;
-    const vh = this.canvas2D.height;
-    const centerX = vw / 2;
-    const centerY = vh / 2;
+  /**
+   * Resets the canvas state to default values.
+   */
+  public resetState(): void {
+    this.state = { ...DEFAULT_STATE };
+    this.pointer = {
+      isDragging: false,
+      startX: 0,
+      startY: 0,
+      lastTranslateX: 0,
+      lastTranslateY: 0,
+    };
+  }
 
+  /**
+   * Handles canvas resize to fill its container while maintaining aspect ratio.
+   */
+  public handleResize(): void {
+    const parent = this.canvas.parentElement;
+    if (!parent) return;
+
+    const rect = parent.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+
+    this.canvas.width = rect.width * dpr;
+    this.canvas.height = rect.height * dpr;
+
+    this.canvas.style.width = `${rect.width}px`;
+    this.canvas.style.height = `${rect.height}px`;
+
+    // Scale the context to account for device pixel ratio
+    this.ctx.scale(dpr, dpr);
+
+    // Reset canvas dimensions stored for rendering calculations
+    // We'll store the CSS dimensions for coordinate calculations
+    (this.canvas as any)._cssWidth = rect.width;
+    (this.canvas as any)._cssHeight = rect.height;
+
+    this.needsRender = true;
+    this.scheduleRender();
+  }
+
+  /**
+   * Gets the CSS (logical) dimensions of the canvas.
+   */
+  private getCanvasWidth(): number {
+    return (this.canvas as any)._cssWidth || this.canvas.width;
+  }
+
+  private getCanvasHeight(): number {
+    return (this.canvas as any)._cssHeight || this.canvas.height;
+  }
+
+  /**
+   * The main rendering method. Applies the full transformation matrix
+   * and draws the image using hardware-accelerated canvas operations.
+   *
+   * Transformation order (applied bottom-up):
+   * 1. Translate to center of canvas
+   * 2. Apply rotation around center
+   * 3. Apply scale (flipX/flipY and zoom)
+   * 4. Apply panning translation
+   * 5. Draw image offset by half its dimensions
+   */
+  public render(): void {
+    const ctx = this.ctx;
+    const img = this.image;
+
+    if (!img.complete || img.naturalWidth === 0) return;
+
+    const canvasWidth = this.getCanvasWidth();
+    const canvasHeight = this.getCanvasHeight();
+
+    // Calculate the geometric center of the canvas viewport
+    const centerX = canvasWidth / 2;
+    const centerY = canvasHeight / 2;
+
+    // Wipe the previous frame
+    ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+    // Save the pristine canvas coordinate state
     ctx.save();
-    // Move origin to canvas centre
+
+    // Step 1: Shift origin to canvas center
     ctx.translate(centerX, centerY);
-    // Apply rotation (degrees → radians)
-    ctx.rotate((rotation * Math.PI) / 180);
-    // Apply flipping
-    ctx.scale(flipX ? -1 : 1, flipY ? -1 : 1);
-    // Apply zoom and translation
-    ctx.scale(zoom, zoom);
-    ctx.translate(translateX, translateY);
-    // Draw image centred on origin
-    ctx.drawImage(this.img, -width / 2, -height / 2);
-    ctx.restore();
-  }
 
-  /* ================================================================
-   *  INTERNAL — Helpers
-   * ================================================================ */
+    // Step 2: Apply angular rotation (convert degrees to radians)
+    ctx.rotate((this.state.rotation * Math.PI) / 180);
 
-  private async loadImageFromUrl(url: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => {
-        this.img = img;
-        // Reset state
-        this.state = { zoom: 1, translateX: 0, translateY: 0, rotation: 0, flipX: false, flipY: false };
-        this.maskActive = false;
-        this.maskData = null;
-
-        // Update WebGL texture
-        this.webGLFilter.updateTexture(this.img!);
-
-        // Auto-scale to fit viewport
-        this.fitToViewport();
-
-        this.callbacks.onStateChange?.();
-        resolve();
-      };
-      img.onerror = reject;
-      img.src = url;
-    });
-  }
-
-  private revokeUrls(): void {
-    if (this.imgUrl) {
-      URL.revokeObjectURL(this.imgUrl);
-      this.imgUrl = null;
-    }
-    if (this.originalBlobUrl) {
-      URL.revokeObjectURL(this.originalBlobUrl);
-      this.originalBlobUrl = null;
-    }
-  }
-
-  private clampPan(): void {
-    if (!this.img) return;
-    const { zoom } = this.state;
-    const imgW = this.img.width * zoom;
-    const imgH = this.img.height * zoom;
-    const maxX = Math.max(0, (imgW - this.canvas2D.width) / 2);
-    const maxY = Math.max(0, (imgH - this.canvas2D.height) / 2);
-    this.state.translateX = Math.max(-maxX, Math.min(maxX, this.state.translateX));
-    this.state.translateY = Math.max(-maxY, Math.min(maxY, this.state.translateY));
-  }
-
-  private fitToViewport(): void {
-    if (!this.img) return;
-    const vw = this.canvas2D.width;
-    const vh = this.canvas2D.height;
-    const iw = this.img.width;
-    const ih = this.img.height;
-    const fit = Math.min(vw / iw, vh / ih);
-    this.state.zoom = fit;
-    this.state.translateX = 0;
-    this.state.translateY = 0;
-    this.clampPan();
-  }
-
-  /* ================================================================
-   *  INTERNAL — History Replay
-   * ================================================================ */
-
-  private replayHistory(): void {
-    // Reset to defaults, then walk through remaining undo stack
-    this.state = { zoom: 1, translateX: 0, translateY: 0, rotation: 0, flipX: false, flipY: false };
-    this.filterUniforms = { brightness: 0, contrast: 1, saturation: 1 };
-    this.maskActive = false;
-    this.maskData = null;
-
-    for (const entry of this.history.getAll()) {
-      // Apply transform
-      if (entry.transform) this.state = { ...entry.transform };
-      if (entry.filter) {
-        this.filterUniforms = { ...entry.filter };
-        this.webGLFilter.uniforms.brightness = entry.filter.brightness;
-        this.webGLFilter.uniforms.contrast = entry.filter.contrast;
-        this.webGLFilter.uniforms.saturation = entry.filter.saturation;
-      }
-      // Re-ingest / other actions are implicit
-    }
-
-    this.clampPan();
-    this.callbacks.onStateChange?.();
-    this.callbacks.onHistoryChange?.();
-  }
-
-  /* ================================================================
-   *  INTERNAL — Worker message handlers
-   * ================================================================ */
-
-  private async handleDecoderMessage(e: MessageEvent): Promise<void> {
-    const { blob, error } = e.data;
-    if (error) {
-      this.callbacks.onError?.(`HEIC decode: ${error}`);
-      return;
-    }
-    if (blob) {
-      this.imgUrl = URL.createObjectURL(blob);
-      await this.loadImageFromUrl(this.imgUrl);
-      this.webGLFilter.updateTexture(this.img!);
-    }
-  }
-
-  private handleAIWorkerMessage(e: MessageEvent): void {
-    if (e.data.type === 'AI_MASK_READY') {
-      this.maskData = e.data.mask as ImageData;
-      this.maskActive = true;
-      // Update WebGL texture with the masked image
-      const w = this.canvas2D.width;
-      const h = this.canvas2D.height;
-      this.webGLFilter.updateTexture(this.ctx2D.getImageData(0, 0, w, h));
-
-      this.callbacks.onAITaskEnd?.('mask');
-    }
-    this.callbacks.onAITaskEnd?.('mask');
-  }
-
-  private handleAutoCropMessage(e: MessageEvent): void {
-    if (e.data.type === 'AUTO_CROP_READY' && e.data.bbox) {
-      const bbox = e.data.bbox as { x: number; y: number; width: number; height: number };
-      if (!this.img) return;
-
-      // Calculate focal point of detected subject
-      const focalX = bbox.x + bbox.width / 2;
-      const focalY = bbox.y + bbox.height / 2;
-
-      // Calculate translation to centre the focal point in the viewport
-      const imgCenterX = this.img.width / 2;
-      const imgCenterY = this.img.height / 2;
-
-      const targetX = (imgCenterX - focalX) / this.state.zoom;
-      const targetY = (imgCenterY - focalY) / this.state.zoom;
-
-      const startX = this.state.translateX;
-      const startY = this.state.translateY;
-      const durationMs = 350;
-      const startTime = performance.now();
-
-      const animateCrop = (now: number) => {
-        const elapsed = now - startTime;
-        const progress = Math.min(elapsed / durationMs, 1);
-        const ease = 1 - Math.pow(1 - progress, 3); // cubic ease-out
-
-        this.state.translateX = startX + (targetX - startX) * ease;
-        this.state.translateY = startY + (targetY - startY) * ease;
-        this.clampPan();
-        this.callbacks.onStateChange?.();
-
-        if (progress < 1) {
-          requestAnimationFrame(animateCrop);
-        } else {
-          this.history.push(
-            HistoryManager.panImage(this.state.translateX, this.state.translateY, { ...this.state })
-          );
-        }
-      };
-      requestAnimationFrame(animateCrop);
-    }
-    this.callbacks.onAITaskEnd?.('crop');
-  }
-
-  /* ================================================================
-   *  INTERNAL — Pan Handlers
-   * ================================================================ */
-
-  private setupPanHandlers(): void {
-    let isDown = false;
-    let lastX = 0;
-    let lastY = 0;
-
-    this.canvas2D.addEventListener('mousedown', (e) => {
-      if (e.button !== 0) return;
-      isDown = true;
-      lastX = e.clientX;
-      lastY = e.clientY;
-    });
-    window.addEventListener('mousemove', (e) => {
-      if (!isDown) return;
-      const dx = (e.clientX - lastX) / this.state.zoom;
-      const dy = (e.clientY - lastY) / this.state.zoom;
-      this.pan(dx, dy);
-      lastX = e.clientX;
-      lastY = e.clientY;
-    });
-    window.addEventListener('mouseup', () => {
-      if (isDown) {
-        isDown = false;
-        // Push history for the pan gesture
-        this.history.push(
-          HistoryManager.panImage(this.state.translateX, this.state.translateY, { ...this.state }),
-        );
-      }
-    });
-
-    // Touch support
-    this.canvas2D.addEventListener('touchstart', (e) => {
-      isDown = true;
-      const touch = e.touches[0];
-      lastX = touch.clientX;
-      lastY = touch.clientY;
-    });
-    this.canvas2D.addEventListener('touchmove', (e) => {
-      if (!isDown) return;
-      const touch = e.touches[0];
-      const dx = (touch.clientX - lastX) / this.state.zoom;
-      const dy = (touch.clientY - lastY) / this.state.zoom;
-      this.pan(dx, dy);
-      lastX = touch.clientX;
-      lastY = touch.clientY;
-    });
-    this.canvas2D.addEventListener('touchend', () => {
-      if (isDown) {
-        isDown = false;
-        this.history.push(
-          HistoryManager.panImage(this.state.translateX, this.state.translateY, { ...this.state }),
-        );
-      }
-    });
-
-    // Mouse wheel zoom
-    this.canvas2D.addEventListener(
-      'wheel',
-      (e) => {
-        e.preventDefault();
-        const delta = e.deltaY > 0 ? -0.1 : 0.1;
-        const newZoom = Math.max(0.1, Math.min(10, this.state.zoom + delta));
-        this.setZoom(newZoom);
-      },
-      { passive: false },
+    // Step 3: Apply scaling and mirroring simultaneously
+    ctx.scale(
+      (this.state.flipX ? -1 : 1) * this.state.zoom,
+      (this.state.flipY ? -1 : 1) * this.state.zoom
     );
+
+    // Step 4: Apply user panning coordinates
+    ctx.translate(this.state.translateX, this.state.translateY);
+
+    // Step 5: Draw image offset by exactly half its dimensions to maintain centering
+    ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+
+    // Restore the coordinate state for the next frame
+    ctx.restore();
+
+    this.needsRender = false;
+  }
+
+  /**
+   * Schedules a render using requestAnimationFrame to sync with the monitor's refresh rate.
+   */
+  private scheduleRender(): void {
+    if (this.animationFrameId !== null) return;
+
+    this.animationFrameId = requestAnimationFrame(() => {
+      this.animationFrameId = null;
+      if (this.needsRender) {
+        this.render();
+      }
+    });
+  }
+
+  // ===== Mouse/Touch Interaction Handlers =====
+
+  private setupEventListeners(): void {
+    // Mouse events
+    this.canvas.addEventListener('mousedown', this.onPointerDown);
+    window.addEventListener('mousemove', this.onPointerMove);
+    window.addEventListener('mouseup', this.onPointerUp);
+
+    // Touch events
+    this.canvas.addEventListener('touchstart', this.onTouchStart, { passive: false });
+    window.addEventListener('touchmove', this.onTouchMove, { passive: false });
+    window.addEventListener('touchend', this.onTouchEnd);
+
+    // Wheel/scroll for zoom
+    this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
+
+    // Prevent context menu on canvas
+    this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+
+  private onPointerDown = (e: MouseEvent): void => {
+    this.pointer.isDragging = true;
+    this.pointer.startX = e.clientX;
+    this.pointer.startY = e.clientY;
+    this.pointer.lastTranslateX = this.state.translateX;
+    this.pointer.lastTranslateY = this.state.translateY;
+    this.canvas.style.cursor = 'grabbing';
+  };
+
+  private onPointerMove = (e: MouseEvent): void => {
+    if (!this.pointer.isDragging) return;
+
+    const deltaX = e.clientX - this.pointer.startX;
+    const deltaY = e.clientY - this.pointer.startY;
+
+    // Divide delta by zoom to ensure 1:1 cursor tracking
+    this.state.translateX = this.pointer.lastTranslateX + deltaX / this.state.zoom;
+    this.state.translateY = this.pointer.lastTranslateY + deltaY / this.state.zoom;
+
+    this.clampBoundaries();
+    this.needsRender = true;
+    this.scheduleRender();
+  };
+
+  private onPointerUp = (): void => {
+    this.pointer.isDragging = false;
+    this.canvas.style.cursor = 'grab';
+  };
+
+  private onTouchStart = (e: TouchEvent): void => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      const touch = e.touches[0];
+      this.pointer.isDragging = true;
+      this.pointer.startX = touch.clientX;
+      this.pointer.startY = touch.clientY;
+      this.pointer.lastTranslateX = this.state.translateX;
+      this.pointer.lastTranslateY = this.state.translateY;
+    }
+  };
+
+  private onTouchMove = (e: TouchEvent): void => {
+    e.preventDefault();
+    if (!this.pointer.isDragging || e.touches.length !== 1) return;
+
+    const touch = e.touches[0];
+    const deltaX = touch.clientX - this.pointer.startX;
+    const deltaY = touch.clientY - this.pointer.startY;
+
+    this.state.translateX = this.pointer.lastTranslateX + deltaX / this.state.zoom;
+    this.state.translateY = this.pointer.lastTranslateY + deltaY / this.state.zoom;
+
+    this.clampBoundaries();
+    this.needsRender = true;
+    this.scheduleRender();
+  };
+
+  private onTouchEnd = (): void => {
+    this.pointer.isDragging = false;
+  };
+
+  /**
+   * Wheel event handler for zooming. Zooms toward the cursor position.
+   */
+  private onWheel = (e: WheelEvent): void => {
+    e.preventDefault();
+
+    const delta = -e.deltaY;
+    const zoomFactor = delta > 0 ? 1.1 : 1 / 1.1;
+
+    const newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, this.state.zoom * zoomFactor));
+    this.state.zoom = newZoom;
+
+    this.clampBoundaries();
+    this.needsRender = true;
+    this.scheduleRender();
+  };
+
+  /**
+   * Clamps translateX and translateY to prevent dragging the image out of bounds.
+   * Calculates max allowed offsets dynamically based on current zoom.
+   */
+  private clampBoundaries(): void {
+    if (this.image.naturalWidth === 0) return;
+
+    const canvasWidth = this.getCanvasWidth();
+    const canvasHeight = this.getCanvasHeight();
+
+    // Calculate max allowed offsets based on current zoom
+    const maxOffsetX = Math.max(0, (this.image.naturalWidth * this.state.zoom - canvasWidth) / 2);
+    const maxOffsetY = Math.max(0, (this.image.naturalHeight * this.state.zoom - canvasHeight) / 2);
+
+    this.state.translateX = Math.max(-maxOffsetX, Math.min(maxOffsetX, this.state.translateX));
+    this.state.translateY = Math.max(-maxOffsetY, Math.min(maxOffsetY, this.state.translateY));
+  }
+
+  /**
+   * Sets the zoom level and clamps it within bounds.
+   */
+  public setZoom(zoom: number): void {
+    this.state.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom));
+    this.clampBoundaries();
+    this.needsRender = true;
+    this.scheduleRender();
+  }
+
+  /**
+   * Sets the rotation in degrees.
+   */
+  public setRotation(degrees: number): void {
+    this.state.rotation = degrees % 360;
+    this.needsRender = true;
+    this.scheduleRender();
+  }
+
+  /**
+   * Toggles horizontal flip.
+   */
+  public toggleFlipX(): void {
+    this.state.flipX = !this.state.flipX;
+    this.needsRender = true;
+    this.scheduleRender();
+  }
+
+  /**
+   * Toggles vertical flip.
+   */
+  public toggleFlipY(): void {
+    this.state.flipY = !this.state.flipY;
+    this.needsRender = true;
+    this.scheduleRender();
+  }
+
+  /**
+   * Gets the current canvas state.
+   */
+  public getState(): CanvasState {
+    return { ...this.state };
+  }
+
+  /**
+   * Cleans up resources. Call when the component unmounts.
+   */
+  public destroy(): void {
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
+
+    // Remove event listeners
+    this.canvas.removeEventListener('mousedown', this.onPointerDown);
+    window.removeEventListener('mousemove', this.onPointerMove);
+    window.removeEventListener('mouseup', this.onPointerUp);
+    this.canvas.removeEventListener('touchstart', this.onTouchStart);
+    window.removeEventListener('touchmove', this.onTouchMove);
+    window.removeEventListener('touchend', this.onTouchEnd);
+    this.canvas.removeEventListener('wheel', this.onWheel);
+
+    // Revoke Object URL
+    if (this.currentImageUrl) {
+      URL.revokeObjectURL(this.currentImageUrl);
+      this.currentImageUrl = null;
+    }
+
+    // Clear canvas
+    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+  }
+
+  /**
+   * Returns whether the canvas currently has a loaded image.
+   */
+  public hasImage(): boolean {
+    return this.image.complete && this.image.naturalWidth > 0;
   }
 }
