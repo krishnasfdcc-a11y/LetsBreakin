@@ -44,6 +44,11 @@
   background: #555;
 }
 
+.toolbar-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .upload-button {
   background: #1a6dff;
   border-color: #1a6dff;
@@ -54,6 +59,19 @@
 .upload-button:hover {
   background: #1558d4;
   border-color: #1558d4;
+}
+
+/* AI action buttons */
+.ai-button {
+  background: #2d1b69;
+  border-color: #4a2d8a;
+  color: #c8b8ff;
+}
+
+.ai-button:hover:not(:disabled) {
+  background: #3d2589;
+  border-color: #5d3daa;
+  color: #e0d0ff;
 }
 
 .toolbar-separator {
@@ -73,6 +91,32 @@
   color: #aaa;
 }
 
+.ai-loading {
+  gap: 6px;
+}
+
+.ai-progress-bar {
+  width: 80px;
+  height: 4px;
+  background: #444;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.ai-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4a2d8a, #7b4dff);
+  border-radius: 2px;
+  transition: width 0.15s ease;
+}
+
+.ai-progress-text {
+  font-size: 11px;
+  color: #7b4dff;
+  min-width: 70px;
+  font-variant-numeric: tabular-nums;
+}
+
 .spinner {
   width: 16px;
   height: 16px;
@@ -80,6 +124,7 @@
   border-top-color: #1a6dff;
   border-radius: 50%;
   animation: spin 0.6s linear infinite;
+  flex-shrink: 0;
 }
 
 @keyframes spin {

@@ -51,6 +51,18 @@ export class CanvasManager {
   private needsRender: boolean = false;
   private currentImageUrl: string | null = null;
 
+  // AI mask compositing
+  private maskCanvas: HTMLCanvasElement | null = null;
+  private maskCtx: CanvasRenderingContext2D | null = null;
+  private hasActiveMask: boolean = false;
+
+  // Lerp animation for smart crop
+  private lerpAnimationFrameId: number | null = null;
+  private lerpTarget: { translateX: number; translateY: number; zoom: number } | null = null;
+  private lerpStart: { translateX: number; translateY: number; zoom: number } | null = null;
+  private lerpProgress: number = 0;
+  private readonly LERP_DURATION_MS: number = 400;
+
   /**
    * Callback fired when the image is loaded and ready for rendering.
    */
@@ -84,15 +96,14 @@ export class CanvasManager {
    * Revokes the previous Object URL to prevent memory leaks.
    */
   public setImageSource(imageUrl: string): void {
-    // Revoke the previous Object URL to prevent RAM leaks
     if (this.currentImageUrl) {
       URL.revokeObjectURL(this.currentImageUrl);
     }
 
     this.currentImageUrl = imageUrl;
     this.resetState();
+    this.clearMask();
 
-    // Set up the onload handler before setting src
     this.image.onload = () => {
       this.handleResize();
       this.needsRender = true;
@@ -137,11 +148,9 @@ export class CanvasManager {
     this.canvas.style.width = `${rect.width}px`;
     this.canvas.style.height = `${rect.height}px`;
 
-    // Scale the context to account for device pixel ratio
-    this.ctx.setTransform(1, 0, 0, 1, 0, 0); // Reset transform first
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
     this.ctx.scale(dpr, dpr);
 
-    // Reset canvas dimensions stored for rendering calculations
     (this.canvas as any)._cssWidth = rect.width;
     (this.canvas as any)._cssHeight = rect.height;
 
@@ -160,16 +169,89 @@ export class CanvasManager {
     return (this.canvas as any)._cssHeight || this.canvas.height;
   }
 
+  // ===================== Part 1: Image Data Extraction =====================
+
   /**
-   * The main rendering method. Applies the full transformation matrix
-   * and draws the image using hardware-accelerated canvas operations.
-   *
-   * Transformation order (applied bottom-up):
-   * 1. Translate to center of canvas
-   * 2. Apply rotation around center
-   * 3. Apply scale (flipX/flipY and zoom)
-   * 4. Apply panning translation
-   * 5. Draw image offset by half its dimensions
+   * Extracts raw ImageData from the source image without any transformations.
+   * Uses a temporary offscreen canvas for rendering, then calls getImageData.
+   */
+  public extractImageData(): ImageData | null {
+    if (!this.image.complete || this.image.naturalWidth === 0) return null;
+
+    const width = this.image.naturalWidth;
+    const height = this.image.naturalHeight;
+
+    // Create a temporary offscreen canvas
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = width;
+    tempCanvas.height = height;
+    const tempCtx = tempCanvas.getContext('2d');
+
+    if (!tempCtx) return null;
+
+    // Draw the current image without transformations
+    tempCtx.drawImage(this.image, 0, 0, width, height);
+
+    // Extract the raw pixel data
+    return tempCtx.getImageData(0, 0, width, height);
+  }
+
+  // ===================== Part 4: AI Mask Compositing =====================
+
+  /**
+   * Applies an AI-generated mask to the image.
+   * The mask is an ImageData where the alpha channel determines visibility
+   * (0 = transparent background, 255 = solid foreground).
+   */
+  public applyMask(maskImageData: ImageData): void {
+    if (!this.image.complete || this.image.naturalWidth === 0) return;
+
+    const width = this.image.naturalWidth;
+    const height = this.image.naturalHeight;
+
+    // Create an invisible offscreen mask buffer matching the original image size
+    if (!this.maskCanvas || this.maskCanvas.width !== width || this.maskCanvas.height !== height) {
+      this.maskCanvas = document.createElement('canvas');
+      this.maskCanvas.width = width;
+      this.maskCanvas.height = height;
+      this.maskCanvas.id = 'mask-buffer';
+      this.maskCtx = this.maskCanvas.getContext('2d')!;
+    }
+
+    if (!this.maskCtx) return;
+
+    // Write the AI mask data to the offscreen mask buffer
+    this.maskCtx.putImageData(maskImageData, 0, 0);
+    this.hasActiveMask = true;
+
+    // Trigger a re-render
+    this.needsRender = true;
+    this.scheduleRender();
+  }
+
+  /**
+   * Clears the active AI mask.
+   */
+  public clearMask(): void {
+    this.hasActiveMask = false;
+    this.maskCanvas = null;
+    this.maskCtx = null;
+    this.needsRender = true;
+    this.scheduleRender();
+  }
+
+  /**
+   * Returns whether an AI mask is currently active.
+   */
+  public isMaskActive(): boolean {
+    return this.hasActiveMask;
+  }
+
+  // ===================== Main Rendering Loop =====================
+
+  /**
+   * The main rendering method with mask compositing support.
+   * If a mask is active, it applies it using destination-in compositing.
    */
   public render(): void {
     const ctx = this.ctx;
@@ -179,36 +261,53 @@ export class CanvasManager {
 
     const canvasWidth = this.getCanvasWidth();
     const canvasHeight = this.getCanvasHeight();
-
-    // Calculate the geometric center of the canvas viewport
     const centerX = canvasWidth / 2;
     const centerY = canvasHeight / 2;
 
     // Wipe the previous frame
     ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
-    // Save the pristine canvas coordinate state
     ctx.save();
 
-    // Step 1: Shift origin to canvas center
+    // Step 1-4: Apply transformation matrix
     ctx.translate(centerX, centerY);
-
-    // Step 2: Apply angular rotation (convert degrees to radians)
     ctx.rotate((this.state.rotation * Math.PI) / 180);
-
-    // Step 3: Apply scaling and mirroring simultaneously
     ctx.scale(
       (this.state.flipX ? -1 : 1) * this.state.zoom,
       (this.state.flipY ? -1 : 1) * this.state.zoom
     );
-
-    // Step 4: Apply user panning coordinates
     ctx.translate(this.state.translateX, this.state.translateY);
 
-    // Step 5: Draw image offset by exactly half its dimensions to maintain centering
+    // Step 5: Draw the original image
     ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
 
-    // Restore the coordinate state for the next frame
+    // Step 6: If a mask is active, apply it using destination-in compositing
+    if (this.hasActiveMask && this.maskCanvas) {
+      // destination-in: only keep pixels where the mask is opaque
+      ctx.globalCompositeOperation = 'destination-in';
+
+      // Reset transform to draw mask at canvas coordinates
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      const dpr = window.devicePixelRatio || 1;
+      ctx.scale(dpr, dpr);
+
+      // Draw the mask buffer over the canvas
+      // We need to draw it scaled to the viewport, respecting the transform
+      ctx.save();
+      ctx.translate(centerX, centerY);
+      ctx.rotate((this.state.rotation * Math.PI) / 180);
+      ctx.scale(
+        (this.state.flipX ? -1 : 1) * this.state.zoom,
+        (this.state.flipY ? -1 : 1) * this.state.zoom
+      );
+      ctx.translate(this.state.translateX, this.state.translateY);
+      ctx.drawImage(this.maskCanvas, -img.naturalWidth / 2, -img.naturalHeight / 2);
+      ctx.restore();
+
+      // Reset composite operation back to normal
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
     ctx.restore();
 
     this.needsRender = false;
@@ -234,20 +333,16 @@ export class CanvasManager {
   // ===== Mouse/Touch Interaction Handlers =====
 
   private setupEventListeners(): void {
-    // Mouse events
     this.canvas.addEventListener('mousedown', this.onPointerDown);
     window.addEventListener('mousemove', this.onPointerMove);
     window.addEventListener('mouseup', this.onPointerUp);
 
-    // Touch events
     this.canvas.addEventListener('touchstart', this.onTouchStart, { passive: false });
     window.addEventListener('touchmove', this.onTouchMove, { passive: false });
     window.addEventListener('touchend', this.onTouchEnd);
 
-    // Wheel/scroll for zoom
     this.canvas.addEventListener('wheel', this.onWheel, { passive: false });
 
-    // Prevent context menu on canvas
     this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   }
 
@@ -266,7 +361,6 @@ export class CanvasManager {
     const deltaX = e.clientX - this.pointer.startX;
     const deltaY = e.clientY - this.pointer.startY;
 
-    // Divide delta by zoom to ensure 1:1 cursor tracking
     this.state.translateX = this.pointer.lastTranslateX + deltaX / this.state.zoom;
     this.state.translateY = this.pointer.lastTranslateY + deltaY / this.state.zoom;
 
@@ -312,9 +406,6 @@ export class CanvasManager {
     this.pointer.isDragging = false;
   };
 
-  /**
-   * Wheel event handler for zooming. Zooms toward the cursor position.
-   */
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault();
 
@@ -329,17 +420,12 @@ export class CanvasManager {
     this.scheduleRender();
   };
 
-  /**
-   * Clamps translateX and translateY to prevent dragging the image out of bounds.
-   * Calculates max allowed offsets dynamically based on current zoom.
-   */
   private clampBoundaries(): void {
     if (this.image.naturalWidth === 0) return;
 
     const canvasWidth = this.getCanvasWidth();
     const canvasHeight = this.getCanvasHeight();
 
-    // Calculate max allowed offsets based on current zoom
     const maxOffsetX = Math.max(0, (this.image.naturalWidth * this.state.zoom - canvasWidth) / 2);
     const maxOffsetY = Math.max(0, (this.image.naturalHeight * this.state.zoom - canvasHeight) / 2);
 
@@ -347,9 +433,8 @@ export class CanvasManager {
     this.state.translateY = Math.max(-maxOffsetY, Math.min(maxOffsetY, this.state.translateY));
   }
 
-  /**
-   * Sets the zoom level and clamps it within bounds.
-   */
+  // ===== Public Transform Methods =====
+
   public setZoom(zoom: number): void {
     this.state.zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom));
     this.clampBoundaries();
@@ -357,50 +442,135 @@ export class CanvasManager {
     this.scheduleRender();
   }
 
-  /**
-   * Sets the rotation in degrees.
-   */
   public setRotation(degrees: number): void {
     this.state.rotation = degrees % 360;
     this.needsRender = true;
     this.scheduleRender();
   }
 
-  /**
-   * Toggles horizontal flip.
-   */
   public toggleFlipX(): void {
     this.state.flipX = !this.state.flipX;
     this.needsRender = true;
     this.scheduleRender();
   }
 
-  /**
-   * Toggles vertical flip.
-   */
   public toggleFlipY(): void {
     this.state.flipY = !this.state.flipY;
     this.needsRender = true;
     this.scheduleRender();
   }
 
-  /**
-   * Gets the current canvas state.
-   */
   public getState(): CanvasState {
     return { ...this.state };
   }
 
+  public getImageWidth(): number {
+    return this.image.naturalWidth;
+  }
+
+  public getImageHeight(): number {
+    return this.image.naturalHeight;
+  }
+
+  // ===================== Part 6: Lerp Animation for Auto-Crop =====================
+
   /**
-   * Cleans up resources. Call when the component unmounts.
+   * Smoothly animates the viewport to center on a focal point (from AI smart crop).
+   * Uses Linear Interpolation (Lerp) over ~400ms.
+   *
+   * @param focalX - X coordinate of the focal point (in image pixels)
+   * @param focalY - Y coordinate of the focal point (in image pixels)
    */
+  public animateToFocalPoint(focalX: number, focalY: number): void {
+    // Stop any existing lerp animation
+    this.stopLerpAnimation();
+
+    const imgW = this.image.naturalWidth;
+    const imgH = this.image.naturalHeight;
+
+    // Calculate target translate to center the focal point
+    // In the current transform, translate is applied after center translation
+    // So we need to offset: focal point in image coords -> screen coords
+    const targetTranslateX = -(focalX - imgW / 2);
+    const targetTranslateY = -(focalY - imgH / 2);
+
+    // Store start and target values
+    this.lerpStart = {
+      translateX: this.state.translateX,
+      translateY: this.state.translateY,
+      zoom: this.state.zoom,
+    };
+
+    this.lerpTarget = {
+      translateX: targetTranslateX,
+      translateY: targetTranslateY,
+      zoom: this.state.zoom, // Keep zoom constant during focal animation
+    };
+
+    this.lerpProgress = 0;
+    this.runLerpAnimation(performance.now());
+  }
+
+  private runLerpAnimation(startTime: number): void {
+    if (!this.lerpStart || !this.lerpTarget) return;
+
+    const elapsed = performance.now() - startTime;
+    this.lerpProgress = Math.min(elapsed / this.LERP_DURATION_MS, 1);
+
+    // Ease-out cubic for smooth deceleration
+    const t = 1 - Math.pow(1 - this.lerpProgress, 3);
+
+    // Apply Lerp formula: current = start + (target - start) * t
+    this.state.translateX = this.lerpStart.translateX + (this.lerpTarget.translateX - this.lerpStart.translateX) * t;
+    this.state.translateY = this.lerpStart.translateY + (this.lerpTarget.translateY - this.lerpStart.translateY) * t;
+    this.state.zoom = this.lerpStart.zoom + (this.lerpTarget.zoom - this.lerpStart.zoom) * t;
+
+    this.clampBoundaries();
+
+    // Trigger Phase 1 render
+    this.needsRender = true;
+    this.scheduleRender();
+
+    // Halt when difference is less than 0.5 pixels
+    const dx = Math.abs(this.state.translateX - this.lerpTarget.translateX);
+    const dy = Math.abs(this.state.translateY - this.lerpTarget.translateY);
+
+    if (this.lerpProgress >= 1 || (dx < 0.5 && dy < 0.5)) {
+      // Snap to final position
+      this.state.translateX = this.lerpTarget.translateX;
+      this.state.translateY = this.lerpTarget.translateY;
+      this.state.zoom = this.lerpTarget.zoom;
+      this.clampBoundaries();
+      this.needsRender = true;
+      this.scheduleRender();
+      this.lerpTarget = null;
+      this.lerpStart = null;
+      return;
+    }
+
+    // Continue the animation loop
+    this.lerpAnimationFrameId = requestAnimationFrame(() => this.runLerpAnimation(startTime));
+  }
+
+  private stopLerpAnimation(): void {
+    if (this.lerpAnimationFrameId !== null) {
+      cancelAnimationFrame(this.lerpAnimationFrameId);
+      this.lerpAnimationFrameId = null;
+    }
+    this.lerpTarget = null;
+    this.lerpStart = null;
+  }
+
+  // ===== Cleanup =====
+
   public destroy(): void {
+    this.stopLerpAnimation();
+
     if (this.animationFrameId !== null) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
     }
 
-    // Remove event listeners
     this.canvas.removeEventListener('mousedown', this.onPointerDown);
     window.removeEventListener('mousemove', this.onPointerMove);
     window.removeEventListener('mouseup', this.onPointerUp);
@@ -409,19 +579,16 @@ export class CanvasManager {
     window.removeEventListener('touchend', this.onTouchEnd);
     this.canvas.removeEventListener('wheel', this.onWheel);
 
-    // Revoke Object URL
     if (this.currentImageUrl) {
       URL.revokeObjectURL(this.currentImageUrl);
       this.currentImageUrl = null;
     }
 
-    // Clear canvas
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    this.maskCanvas = null;
+    this.maskCtx = null;
   }
 
-  /**
-   * Returns whether the canvas currently has a loaded image.
-   */
   public hasImage(): boolean {
     return this.image.complete && this.image.naturalWidth > 0;
   }
