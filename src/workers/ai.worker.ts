@@ -15,6 +15,7 @@
 export interface RequestMessage {
   type: 'REMOVE_BACKGROUND' | 'SMART_CROP';
   imageData: ImageData;
+  maskData?: ImageData;
   requestId?: string;
 }
 
@@ -49,7 +50,7 @@ self.addEventListener('message', async (event: MessageEvent<RequestMessage>) => 
         await handleRemoveBackground(imageData, requestId);
         break;
       case 'SMART_CROP':
-        await handleSmartCrop(imageData, requestId);
+        await handleSmartCrop(imageData, requestId, event.data.maskData);
         break;
       default:
         self.postMessage({
@@ -93,7 +94,7 @@ async function getBackgroundRemovalPipeline(): Promise<any> {
     });
   };
 
-  transformersPipeline = await pipeline('image-segmentation', 'Xenova/modnet', {
+  transformersPipeline = await pipeline('image-segmentation', 'briaai/RMBG-1.4', {
     progress_callback: progressCallback,
   });
 
@@ -209,7 +210,48 @@ async function getCocoDetector(): Promise<any> {
   return cocoDetector;
 }
 
-async function handleSmartCrop(imageData: ImageData, requestId?: string): Promise<void> {
+async function handleSmartCrop(imageData: ImageData, requestId?: string, maskData?: ImageData): Promise<void> {
+  // Feature 1.2: Mask-based Spatial Boundary Analysis (Zero-latency fallback)
+  if (maskData) {
+    let minX = maskData.width;
+    let maxX = 0;
+    let minY = maskData.height;
+    let maxY = 0;
+    let found = false;
+
+    const data = maskData.data;
+    const width = maskData.width;
+    const height = maskData.height;
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const alpha = data[(y * width + x) * 4 + 3];
+        if (alpha > 0) { // Targeting non-zero alpha values
+          found = true;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+
+    if (found) {
+      const subjectWidth = maxX - minX;
+      const subjectHeight = maxY - minY;
+      const focalX = minX + (subjectWidth / 2);
+      const focalY = minY + (subjectHeight / 2);
+
+      const payload: FocalPointPayload = {
+        focalX, focalY, detected: true,
+        bbox: [minX, minY, subjectWidth, subjectHeight],
+        label: 'mask-subject'
+      };
+      self.postMessage({ type: 'FOCAL_POINT', payload, requestId });
+      return; // Skip COCO-SSD entirely
+    }
+  }
+
   const detector = await getCocoDetector();
 
   // Convert ImageData to blob URL for TF.js compatibility

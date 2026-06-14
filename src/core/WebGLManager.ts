@@ -17,6 +17,8 @@ export interface FilterState {
   brightness: number; // -1.0 to 1.0, default 0.0
   contrast: number;   // 0.0 to 3.0, default 1.0
   saturation: number; // 0.0 to 3.0, default 1.0
+  lightAngle: number; // 0.0 to 360.0, default 0.0
+  lightIntensity: number; // 0.0 to 100.0, default 0.0
 }
 
 // ===================== GLSL Shader Sources =====================
@@ -39,9 +41,14 @@ in vec2 v_texCoord;
 out vec4 outColor;
 
 uniform sampler2D u_image;
+uniform sampler2D u_mask;
 uniform float u_brightness;
 uniform float u_contrast;
 uniform float u_saturation;
+uniform float u_lightAngle;
+uniform float u_lightIntensity;
+
+const float PI = 3.14159265359;
 
 void main() {
   // Extract the baseline pixel data from the texture
@@ -58,6 +65,21 @@ void main() {
 
   // Saturation: mix luminance vector with current color
   color.rgb = mix(vec3(luminance), color.rgb, u_saturation);
+
+  // Feature 1.3: AI Portrait Relighting (Mask-based hardware acceleration)
+  float maskAlpha = texture(u_mask, v_texCoord).a;
+  if (maskAlpha >= 0.1) {
+    // Convert user angle to radians
+    float rad = u_lightAngle * (PI / 180.0);
+    // Compute 2D directional light vector
+    vec2 lightDir = vec2(cos(rad), sin(rad));
+    // Calculate spatial distance from simulated light source origin
+    vec2 lightOrigin = vec2(0.5) + lightDir * 0.5;
+    float dist = distance(v_texCoord, lightOrigin);
+    // Apply radial intensity falloff formula
+    float intensityMultiplier = smoothstep(1.0, 0.0, dist) * (u_lightIntensity / 100.0);
+    color.rgb += intensityMultiplier;
+  }
 
   // Clamp to prevent artifacting
   color.rgb = clamp(color.rgb, 0.0, 1.0);
@@ -78,11 +100,16 @@ export class WebGLManager {
   private positionBuffer: WebGLBuffer | null = null;
   private texCoordBuffer: WebGLBuffer | null = null;
   private texture: WebGLTexture | null = null;
+  private maskTexture: WebGLTexture | null = null;
 
   // Uniform locations
+  private imageLoc: WebGLUniformLocation | null = null;
+  private maskLoc: WebGLUniformLocation | null = null;
   private brightLoc: WebGLUniformLocation | null = null;
   private contrastLoc: WebGLUniformLocation | null = null;
   private satLoc: WebGLUniformLocation | null = null;
+  private lightAngleLoc: WebGLUniformLocation | null = null;
+  private lightIntensityLoc: WebGLUniformLocation | null = null;
 
   // Attribute locations
   private positionLoc: number = -1;
@@ -103,6 +130,8 @@ export class WebGLManager {
     brightness: 0.0,
     contrast: 1.0,
     saturation: 1.0,
+    lightAngle: 0.0,
+    lightIntensity: 0.0,
   };
 
   constructor(phase1Canvas: HTMLCanvasElement, webglCanvas: HTMLCanvasElement) {
@@ -269,6 +298,10 @@ export class WebGLManager {
     this.brightLoc = gl.getUniformLocation(program, 'u_brightness');
     this.contrastLoc = gl.getUniformLocation(program, 'u_contrast');
     this.satLoc = gl.getUniformLocation(program, 'u_saturation');
+    this.lightAngleLoc = gl.getUniformLocation(program, 'u_lightAngle');
+    this.lightIntensityLoc = gl.getUniformLocation(program, 'u_lightIntensity');
+    this.imageLoc = gl.getUniformLocation(program, 'u_image');
+    this.maskLoc = gl.getUniformLocation(program, 'u_mask');
 
     // Extract attribute locations
     this.positionLoc = gl.getAttribLocation(program, 'a_position');
@@ -345,6 +378,13 @@ export class WebGLManager {
 
     this.texture = texture;
 
+    this.maskTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.maskTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
     // Perform initial texture upload
     this.updateTexture();
   }
@@ -378,6 +418,24 @@ export class WebGLManager {
       this.phase1Canvas // source: the offscreen canvas element
     );
 
+    this.needsRender = true;
+  }
+
+  /**
+   * Uploads the AI mask to a secondary GPU texture unit for Relighting compositing.
+   */
+  public updateMaskTexture(maskCanvas: HTMLCanvasElement | null): void {
+    const gl = this.gl;
+    if (!gl || !this.maskTexture) return;
+
+    gl.bindTexture(gl.TEXTURE_2D, this.maskTexture);
+
+    if (!maskCanvas || maskCanvas.width === 0) {
+      const placeholder = new Uint8Array([0, 0, 0, 0]);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, placeholder);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, maskCanvas);
+    }
     this.needsRender = true;
   }
 
@@ -433,14 +491,23 @@ export class WebGLManager {
     gl.enableVertexAttribArray(this.texCoordLoc);
     gl.vertexAttribPointer(this.texCoordLoc, 2, gl.FLOAT, false, 0, 0);
 
-    // Bind the texture
+    // Bind the primary image texture to TEXTURE0
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
+    gl.uniform1i(this.imageLoc, 0);
+
+    // Bind the AI mask texture to TEXTURE1
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.maskTexture);
+    gl.uniform1i(this.maskLoc, 1);
 
     // Push current filter state values into GPU uniforms dynamically
     // These values come directly from the plain JS object, bypassing React
     gl.uniform1f(this.brightLoc, this.filterState.brightness);
     gl.uniform1f(this.contrastLoc, this.filterState.contrast);
     gl.uniform1f(this.satLoc, this.filterState.saturation);
+    gl.uniform1f(this.lightAngleLoc, this.filterState.lightAngle);
+    gl.uniform1f(this.lightIntensityLoc, this.filterState.lightIntensity);
 
     // Execute the final draw command: 6 vertices (2 triangles forming the full-screen quad)
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -491,6 +558,11 @@ export class WebGLManager {
     if (this.texture) {
       gl.deleteTexture(this.texture);
       this.texture = null;
+    }
+
+    if (this.maskTexture) {
+      gl.deleteTexture(this.maskTexture);
+      this.maskTexture = null;
     }
   }
 }

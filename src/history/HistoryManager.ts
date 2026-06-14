@@ -40,6 +40,8 @@ export interface HistorySnapshot {
   brightness: number;
   contrast: number;
   saturation: number;
+  lightAngle: number;
+  lightIntensity: number;
   hasMask: boolean;
   maskId: string | null;
 }

@@ -48,6 +48,8 @@ const ImageEditor: React.FC = () => {
   const [displayBrightness, setDisplayBrightness] = useState(0);
   const [displayContrast, setDisplayContrast] = useState(1);
   const [displaySaturation, setDisplaySaturation] = useState(1);
+  const [displayLightAngle, setDisplayLightAngle] = useState(0);
+  const [displayLightIntensity, setDisplayLightIntensity] = useState(0);
 
   // Saved indicator
   const [lastSaved, setLastSaved] = useState<string>('');
@@ -68,6 +70,8 @@ const ImageEditor: React.FC = () => {
       brightness: wm?.filterState.brightness ?? 0,
       contrast: wm?.filterState.contrast ?? 1,
       saturation: wm?.filterState.saturation ?? 1,
+      lightAngle: wm?.filterState.lightAngle ?? 0,
+      lightIntensity: wm?.filterState.lightIntensity ?? 0,
       hasMask: cm?.isMaskActive() ?? false,
       maskId: null,
     };
@@ -91,6 +95,8 @@ const ImageEditor: React.FC = () => {
     wm.filterState.brightness = snapshot.brightness;
     wm.filterState.contrast = snapshot.contrast;
     wm.filterState.saturation = snapshot.saturation;
+    wm.filterState.lightAngle = snapshot.lightAngle;
+    wm.filterState.lightIntensity = snapshot.lightIntensity;
 
     cm.resetState();
     // Apply the restored state
@@ -109,6 +115,8 @@ const ImageEditor: React.FC = () => {
     setDisplayBrightness(snapshot.brightness);
     setDisplayContrast(snapshot.contrast);
     setDisplaySaturation(snapshot.saturation);
+    setDisplayLightAngle(snapshot.lightAngle);
+    setDisplayLightIntensity(snapshot.lightIntensity);
   }, []);
 
   // ===== Initialize Managers =====
@@ -277,6 +285,9 @@ const ImageEditor: React.FC = () => {
           case 'MASK_GENERATED':
             if (canvasManagerRef.current && payload) {
               canvasManagerRef.current.applyMask(payload);
+          // Sync the new mask immediately with the Relighting GPU pipeline
+          const maskCanvas = (canvasManagerRef.current as any).maskCanvas;
+          webglManagerRef.current?.updateMaskTexture(maskCanvas);
               recordHistoryState('APPLY_AI_MASK');
             }
             setIsAILoading(false);
@@ -326,7 +337,19 @@ const ImageEditor: React.FC = () => {
       setIsAILoading(false);
       return;
     }
-    getAIWorker().postMessage({ type: 'SMART_CROP', imageData }, [imageData.data.buffer]);
+    
+    // Feature 1.2: Pass existing mask to Web Worker for coordinate extraction
+    let maskData: ImageData | undefined;
+    if (cm.isMaskActive()) {
+      const maskCanvas = (cm as any).maskCanvas as HTMLCanvasElement;
+      if (maskCanvas) {
+        const ctx = maskCanvas.getContext('2d');
+        if (ctx) maskData = ctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+      }
+    }
+
+    const transferables = maskData ? [imageData.data.buffer, maskData.data.buffer] : [imageData.data.buffer];
+    getAIWorker().postMessage({ type: 'SMART_CROP', imageData, maskData }, transferables);
   }, [getAIWorker]);
 
   // ===== File Handling =====
@@ -465,16 +488,42 @@ const ImageEditor: React.FC = () => {
     recordHistoryState('UPDATE_FILTER');
   }, [recordHistoryState]);
 
+  const handleLightAngleChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseFloat(e.target.value);
+    if (webglRef.current) {
+      webglRef.current.filterState.lightAngle = value;
+      webglRef.current.requestRender();
+    }
+    setDisplayLightAngle(value);
+  }, []);
+
+  const handleLightIntensityChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = parseFloat(e.target.value);
+    if (webglRef.current) {
+      webglRef.current.filterState.lightIntensity = value;
+      webglRef.current.requestRender();
+    }
+    setDisplayLightIntensity(value);
+  }, []);
+
+  const handleLightCommit = useCallback(() => {
+    recordHistoryState('UPDATE_FILTER');
+  }, [recordHistoryState]);
+
   const handleResetFilters = useCallback(() => {
     if (webglRef.current) {
       webglRef.current.filterState.brightness = 0;
       webglRef.current.filterState.contrast = 1;
       webglRef.current.filterState.saturation = 1;
+      webglRef.current.filterState.lightAngle = 0;
+      webglRef.current.filterState.lightIntensity = 0;
       webglRef.current.requestRender();
     }
     setDisplayBrightness(0);
     setDisplayContrast(1);
     setDisplaySaturation(1);
+    setDisplayLightAngle(0);
+    setDisplayLightIntensity(0);
     recordHistoryState('UPDATE_FILTER');
   }, [recordHistoryState]);
 
@@ -636,6 +685,20 @@ const ImageEditor: React.FC = () => {
               onMouseUp={handleSaturationCommit} onTouchEnd={handleSaturationCommit} />
             <span className="filter-value">{displaySaturation.toFixed(2)}</span>
           </div>
+        <div className="filter-group">
+          <span className="filter-label">Light Angle</span>
+          <input type="range" className="filter-slider" min="0" max="360" step="1"
+            value={displayLightAngle} onChange={handleLightAngleChange}
+            onMouseUp={handleLightCommit} onTouchEnd={handleLightCommit} />
+          <span className="filter-value">{displayLightAngle}°</span>
+        </div>
+        <div className="filter-group">
+          <span className="filter-label">Light Intensity</span>
+          <input type="range" className="filter-slider" min="0" max="100" step="1"
+            value={displayLightIntensity} onChange={handleLightIntensityChange}
+            onMouseUp={handleLightCommit} onTouchEnd={handleLightCommit} />
+          <span className="filter-value">{displayLightIntensity}</span>
+        </div>
           <button className="filter-reset" onClick={handleResetFilters} title="Reset filters">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <polyline points="1 4 1 10 7 10" />

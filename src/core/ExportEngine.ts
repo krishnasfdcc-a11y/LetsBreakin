@@ -220,15 +220,30 @@ export class ExportEngine {
       in vec2 v_texCoord;
       out vec4 outColor;
       uniform sampler2D u_image;
+      uniform sampler2D u_mask;
       uniform float u_brightness;
       uniform float u_contrast;
       uniform float u_saturation;
+      uniform float u_lightAngle;
+      uniform float u_lightIntensity;
+      const float PI = 3.14159265359;
       void main() {
         vec4 color = texture(u_image, v_texCoord);
         color.rgb += u_brightness;
         color.rgb = (color.rgb - 0.5) * u_contrast + 0.5;
         float luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
         color.rgb = mix(vec3(luminance), color.rgb, u_saturation);
+        
+        float maskAlpha = texture(u_mask, v_texCoord).a;
+        if (maskAlpha >= 0.1) {
+          float rad = u_lightAngle * (PI / 180.0);
+          vec2 lightDir = vec2(cos(rad), sin(rad));
+          vec2 lightOrigin = vec2(0.5) + lightDir * 0.5;
+          float dist = distance(v_texCoord, lightOrigin);
+          float intensityMultiplier = smoothstep(1.0, 0.0, dist) * (u_lightIntensity / 100.0);
+          color.rgb += intensityMultiplier;
+        }
+        
         color.rgb = clamp(color.rgb, 0.0, 1.0);
         outColor = color;
       }`;
@@ -288,10 +303,28 @@ export class ExportEngine {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas);
 
+    // Texture 1: upload the AI mask as a secondary WebGL texture
+    const maskTexture = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, maskTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    if (this.maskCanvas) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.maskCanvas);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,0]));
+    }
+
     // Set uniforms
+    gl.uniform1i(gl.getUniformLocation(program, 'u_image'), 0);
+    gl.uniform1i(gl.getUniformLocation(program, 'u_mask'), 1);
     gl.uniform1f(gl.getUniformLocation(program, 'u_brightness'), filterState.brightness);
     gl.uniform1f(gl.getUniformLocation(program, 'u_contrast'), filterState.contrast);
     gl.uniform1f(gl.getUniformLocation(program, 'u_saturation'), filterState.saturation);
+    gl.uniform1f(gl.getUniformLocation(program, 'u_lightAngle'), filterState.lightAngle);
+    gl.uniform1f(gl.getUniformLocation(program, 'u_lightIntensity'), filterState.lightIntensity);
 
     // Render
     gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
@@ -301,6 +334,7 @@ export class ExportEngine {
 
     // ===== Part 10: VRAM cleanup =====
     gl.deleteTexture(texture);
+    gl.deleteTexture(maskTexture);
     gl.deleteBuffer(posBuf);
     gl.deleteBuffer(texBuf);
     gl.deleteProgram(program);
