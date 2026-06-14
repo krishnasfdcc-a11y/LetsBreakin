@@ -187,13 +187,14 @@ async function getCocoDetector(): Promise<any> {
   const tfjs = await import('@tensorflow/tfjs');
   const cocoSsd = await import('@tensorflow-models/coco-ssd');
 
-  await tfjs.setBackend('wasm');
-
   self.postMessage({
     type: 'PROGRESS',
     payload: { status: 'loading', percentage: 40, model: 'COCO-SSD' },
   });
 
+  // Load the object detection model (uses default CPU backend)
+  // The WebAssembly backend requires @tensorflow/tfjs-backend-wasm which is not installed.
+  // The default backend works fine for COCO-SSD inference.
   cocoDetector = await cocoSsd.load();
 
   self.postMessage({
