@@ -31,6 +31,10 @@ export class CanvasManager {
   private canvas2D: HTMLCanvasElement;
   private ctx2D: CanvasRenderingContext2D;
 
+  /** Offscreen canvas for 2D transformations before WebGL. */
+  private offscreenCanvas: OffscreenCanvas;
+  private offscreenCtx: OffscreenCanvasRenderingContext2D;
+
   /** The WebGL overlay canvas (foreground, handles filters). */
   private webGLFilter: WebGLFilter;
 
@@ -91,6 +95,12 @@ export class CanvasManager {
     if (!ctx) throw new Error('2D context not supported');
     this.ctx2D = ctx;
 
+    // Create offscreen canvas
+    this.offscreenCanvas = new OffscreenCanvas(c2d.width, c2d.height);
+    const offscreenCtx = this.offscreenCanvas.getContext('2d');
+    if (!offscreenCtx) throw new Error('Offscreen 2D context not supported');
+    this.offscreenCtx = offscreenCtx;
+
     // ── Create WebGL canvas (filter/fx layer) ─────────────────
     const cgl = document.createElement('canvas');
     cgl.style.position = 'absolute';
@@ -144,6 +154,7 @@ export class CanvasManager {
       this.imgUrl = URL.createObjectURL(file);
       this.originalBlobUrl = this.imgUrl;
       await this.loadImageFromUrl(this.imgUrl);
+      this.webGLFilter.updateTexture(this.img!);
 
       // Push history entry
       this.history.push(HistoryManager.ingestImage(this.imgUrl, { ...this.state }));
@@ -295,6 +306,7 @@ export class CanvasManager {
         this.canvas2D.width,
         this.canvas2D.height,
         { format },
+        this.maskActive ? this.maskData : null
       );
 
       triggerDownload(url, `edited-masterpiece.${format === 'image/png' ? 'png' : 'webp'}`);
@@ -373,7 +385,10 @@ export class CanvasManager {
   resize(width: number, height: number): void {
     this.canvas2D.width = width;
     this.canvas2D.height = height;
+    this.offscreenCanvas.width = width;
+    this.offscreenCanvas.height = height;
     this.webGLFilter.resize(width, height);
+    // Re-clamp pan after resize
     this.clampPan();
   }
 
@@ -390,43 +405,48 @@ export class CanvasManager {
    *  INTERNAL — Render Loops
    * ================================================================ */
 
+  /** Rendering loop – runs via requestAnimationFrame */
   private renderLoop2D(): void {
-    this.clearCanvas2D();
+    // Clear both canvases
+    this.ctx2D.clearRect(0, 0, this.canvas2D.width, this.canvas2D.height);
+    this.offscreenCtx.clearRect(0, 0, this.offscreenCanvas.width, this.offscreenCanvas.height);
+
     if (this.img) {
       this.drawTransformedImage();
+      this.webGLFilter.updateTexture(this.offscreenCanvas);
     }
+
     requestAnimationFrame(() => this.renderLoop2D());
   }
 
   private clearCanvas2D(): void {
+    // This method is no longer strictly needed as clearing is done in renderLoop2D
+    // But keeping it for now if other parts of the code still call it.
     this.ctx2D.clearRect(0, 0, this.canvas2D.width, this.canvas2D.height);
   }
 
   private drawTransformedImage(): void {
     if (!this.img) return;
     const { zoom, translateX, translateY, rotation, flipX, flipY } = this.state;
-    const w = this.img.width;
-    const h = this.img.height;
-    const ctx = this.ctx2D;
+    const { width, height } = this.img;
+    const ctx = this.offscreenCtx; // <--- Draw to offscreen context
     const vw = this.canvas2D.width;
     const vh = this.canvas2D.height;
+    const centerX = vw / 2;
+    const centerY = vh / 2;
 
     ctx.save();
-    ctx.translate(vw / 2, vh / 2);
+    // Move origin to canvas centre
+    ctx.translate(centerX, centerY);
+    // Apply rotation (degrees → radians)
     ctx.rotate((rotation * Math.PI) / 180);
+    // Apply flipping
     ctx.scale(flipX ? -1 : 1, flipY ? -1 : 1);
+    // Apply zoom and translation
     ctx.scale(zoom, zoom);
     ctx.translate(translateX, translateY);
-
-    if (this.maskActive && this.maskData) {
-      // Apply AI mask via compositing
-      ctx.drawImage(this.img, -w / 2, -h / 2);
-      ctx.globalCompositeOperation = 'destination-in';
-      ctx.putImageData(this.maskData, -w / 2, -h / 2);
-    } else {
-      ctx.drawImage(this.img, -w / 2, -h / 2);
-    }
-
+    // Draw image centred on origin
+    ctx.drawImage(this.img, -width / 2, -height / 2);
     ctx.restore();
   }
 
@@ -445,7 +465,7 @@ export class CanvasManager {
         this.maskData = null;
 
         // Update WebGL texture
-        this.webGLFilter.updateTexture(img);
+        this.webGLFilter.updateTexture(this.img!);
 
         // Auto-scale to fit viewport
         this.fitToViewport();
@@ -533,11 +553,8 @@ export class CanvasManager {
     }
     if (blob) {
       this.imgUrl = URL.createObjectURL(blob);
-      this.originalBlobUrl = this.imgUrl;
-      this.loadImageFromUrl(this.imgUrl).then(() => {
-        this.history.push(HistoryManager.ingestImage(this.imgUrl!, { ...this.state }));
-        this.saveSession();
-      });
+      await this.loadImageFromUrl(this.imgUrl);
+      this.webGLFilter.updateTexture(this.img!);
     }
   }
 
@@ -545,13 +562,12 @@ export class CanvasManager {
     if (e.data.type === 'AI_MASK_READY') {
       this.maskData = e.data.mask as ImageData;
       this.maskActive = true;
-      // Scale the mask to match the image dimensions
-      // (The mask may be at a different resolution; we store as-is
-      //  and the drawTransformedImage uses putImageData directly.)
-      this.history.push(
-        HistoryManager.applyAIMask('indexeddb://ai-mask', { ...this.state }),
-      );
-      this.callbacks.onStateChange?.();
+      // Update WebGL texture with the masked image
+      const w = this.canvas2D.width;
+      const h = this.canvas2D.height;
+      this.webGLFilter.updateTexture(this.ctx2D.getImageData(0, 0, w, h));
+
+      this.callbacks.onAITaskEnd?.('mask');
     }
     this.callbacks.onAITaskEnd?.('mask');
   }
@@ -569,16 +585,33 @@ export class CanvasManager {
       const imgCenterX = this.img.width / 2;
       const imgCenterY = this.img.height / 2;
 
-      this.state.translateX = (imgCenterX - focalX) / this.state.zoom;
-      this.state.translateY = (imgCenterY - focalY) / this.state.zoom;
-      this.clampPan();
+      const targetX = (imgCenterX - focalX) / this.state.zoom;
+      const targetY = (imgCenterY - focalY) / this.state.zoom;
 
-      // Push history entry as a pan event
-      this.history.push(
-        HistoryManager.panImage(this.state.translateX, this.state.translateY, { ...this.state }),
-      );
+      const startX = this.state.translateX;
+      const startY = this.state.translateY;
+      const durationMs = 350;
+      const startTime = performance.now();
 
-      this.callbacks.onStateChange?.();
+      const animateCrop = (now: number) => {
+        const elapsed = now - startTime;
+        const progress = Math.min(elapsed / durationMs, 1);
+        const ease = 1 - Math.pow(1 - progress, 3); // cubic ease-out
+
+        this.state.translateX = startX + (targetX - startX) * ease;
+        this.state.translateY = startY + (targetY - startY) * ease;
+        this.clampPan();
+        this.callbacks.onStateChange?.();
+
+        if (progress < 1) {
+          requestAnimationFrame(animateCrop);
+        } else {
+          this.history.push(
+            HistoryManager.panImage(this.state.translateX, this.state.translateY, { ...this.state })
+          );
+        }
+      };
+      requestAnimationFrame(animateCrop);
     }
     this.callbacks.onAITaskEnd?.('crop');
   }

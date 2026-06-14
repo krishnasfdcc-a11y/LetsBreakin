@@ -1,0 +1,5 @@
+
+> letsbreakin@1.0.0 build
+> tsc && vite build
+
+src/core/CanvasManager.ts(538,7): error TS1308: 'await' expressions are only allowed within async functions and at the top levels of modules.

@@ -27,6 +27,7 @@ export interface ExportOptions {
  * @param viewportW - The preview viewport width (for proportional scaling).
  * @param viewportH - The preview viewport height (for proportional scaling).
  * @param options - Format & quality settings.
+ * @param maskData - The active AI transparency mask, if applied.
  * @returns Object URL to the final exported blob.
  */
 export async function exportFullResolution(
@@ -35,6 +36,7 @@ export async function exportFullResolution(
   viewportW: number,
   viewportH: number,
   options: ExportOptions = { format: 'image/png' },
+  maskData: ImageData | null = null,
 ): Promise<string> {
   const { format, quality = 0.92 } = options;
   const srcW = sourceImg.naturalWidth || sourceImg.width;
@@ -149,6 +151,16 @@ export async function exportFullResolution(
 
   // Draw image centered
   exportCtx.drawImage(sourceImg, -srcW / 2, -srcH / 2);
+
+  const hasMask = history.some((e) => e.action === 'APPLY_AI_MASK');
+  if (hasMask && maskData) {
+    const maskCanvas = new OffscreenCanvas(maskData.width, maskData.height);
+    maskCanvas.getContext('2d')!.putImageData(maskData, 0, 0);
+    exportCtx.globalCompositeOperation = 'destination-in';
+    exportCtx.drawImage(maskCanvas, -srcW / 2, -srcH / 2, srcW, srcH);
+    exportCtx.globalCompositeOperation = 'source-over';
+  }
+
   exportCtx.restore();
 
   // ── 5. Apply filters via a temporary 2D canvas pixel loop ──────
