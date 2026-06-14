@@ -1,15 +1,11 @@
 /**
  * CanvasManager - Hardware-accelerated 2D rendering engine for image manipulation.
  *
- * Manages canvas state, transformation matrices, and rendering loops.
- * All transformations are applied through the 2D context matrix stack for
- * optimal GPU-accelerated performance.
- *
- * State matrix properties:
- * - zoom: Scale factor (0.1 - 10.0)
- * - translateX/Y: Panning offsets in canvas coordinates
- * - rotation: Angular rotation in degrees
- * - flipX/Y: Mirror transformations
+ * Fixes applied:
+ * - Issue 1: Rendering Origin — ctx.translate(centerX, centerY) + drawImage at -w/2, -h/2
+ * - Issue 2: Initial Fit — zoom calculated to fit image in viewport on load
+ * - Issue 3: Pan Clamping — clampBoundaries prevents dragging into void
+ * - Issue 4: DPR compounding — handleResize uses setTransform instead of ctx.scale
  */
 
 export interface CanvasState {
@@ -56,22 +52,18 @@ export class CanvasManager {
   private maskCtx: CanvasRenderingContext2D | null = null;
   private hasActiveMask: boolean = false;
 
-  // Lerp animation for smart crop
+  // Lerp animation
   private lerpAnimationFrameId: number | null = null;
   private lerpTarget: { translateX: number; translateY: number; zoom: number } | null = null;
   private lerpStart: { translateX: number; translateY: number; zoom: number } | null = null;
   private lerpProgress: number = 0;
   private readonly LERP_DURATION_MS: number = 400;
 
-  /**
-   * Callback fired when the image is loaded and ready for rendering.
-   */
-  public onImageReady: (() => void) | null = null;
+  // CSS dimensions (logical pixels, not physical)
+  private cssWidth: number = 0;
+  private cssHeight: number = 0;
 
-  /**
-   * Callback fired after every render pass to notify the WebGL pipeline
-   * that the texture needs to be refreshed from the Phase 1 canvas.
-   */
+  public onImageReady: (() => void) | null = null;
   public onPostRender: (() => void) | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -92,8 +84,8 @@ export class CanvasManager {
   }
 
   /**
-   * Sets the image source from an Object URL and triggers loading.
-   * Revokes the previous Object URL to prevent memory leaks.
+   * Sets the image source. On load, calculates the initial zoom
+   * to fit the image perfectly inside the viewport (Issue 2 fix).
    */
   public setImageSource(imageUrl: string): void {
     if (this.currentImageUrl) {
@@ -101,13 +93,22 @@ export class CanvasManager {
     }
 
     this.currentImageUrl = imageUrl;
-    this.resetState();
+    this.state = { ...DEFAULT_STATE };
     this.clearMask();
 
     this.image.onload = () => {
+      // Calculate initial zoom to fit image in viewport (Issue 2)
+      const imgW = this.image.naturalWidth;
+      const imgH = this.image.naturalHeight;
+
+      if (this.cssWidth > 0 && this.cssHeight > 0 && imgW > 0 && imgH > 0) {
+        const fitZoom = Math.min(this.cssWidth / imgW, this.cssHeight / imgH);
+        this.state.zoom = Math.min(fitZoom, 1); // Don't upscale, only downscale to fit
+      }
+
       this.handleResize();
       this.needsRender = true;
-      this.scheduleRender();
+      this.render(); // Render immediately, don't wait for rAF
       this.onImageReady?.();
     };
 
@@ -118,9 +119,6 @@ export class CanvasManager {
     this.image.src = imageUrl;
   }
 
-  /**
-   * Resets the canvas state to default values.
-   */
   public resetState(): void {
     this.state = { ...DEFAULT_STATE };
     this.pointer = {
@@ -133,7 +131,7 @@ export class CanvasManager {
   }
 
   /**
-   * Handles canvas resize to fill its container while maintaining aspect ratio.
+   * Handles canvas resize. Uses setTransform to avoid DPR compounding (Issue 4 fix).
    */
   public handleResize(): void {
     const parent = this.canvas.parentElement;
@@ -142,74 +140,58 @@ export class CanvasManager {
     const rect = parent.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
 
+    this.cssWidth = rect.width;
+    this.cssHeight = rect.height;
+
+    // Set physical pixel dimensions
     this.canvas.width = rect.width * dpr;
     this.canvas.height = rect.height * dpr;
 
+    // Set CSS layout dimensions
     this.canvas.style.width = `${rect.width}px`;
     this.canvas.style.height = `${rect.height}px`;
 
-    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
-    this.ctx.scale(dpr, dpr);
-
-    (this.canvas as any)._cssWidth = rect.width;
-    (this.canvas as any)._cssHeight = rect.height;
+    // Use setTransform directly — avoids compounding ctx.scale(dpr) calls (Issue 4)
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     this.needsRender = true;
     this.scheduleRender();
   }
 
-  /**
-   * Gets the CSS (logical) dimensions of the canvas.
-   */
   private getCanvasWidth(): number {
-    return (this.canvas as any)._cssWidth || this.canvas.width;
+    return this.cssWidth || this.canvas.width;
   }
 
   private getCanvasHeight(): number {
-    return (this.canvas as any)._cssHeight || this.canvas.height;
+    return this.cssHeight || this.canvas.height;
   }
 
-  // ===================== Part 1: Image Data Extraction =====================
+  // ===== Image Data Extraction =====
 
-  /**
-   * Extracts raw ImageData from the source image without any transformations.
-   * Uses a temporary offscreen canvas for rendering, then calls getImageData.
-   */
   public extractImageData(): ImageData | null {
     if (!this.image.complete || this.image.naturalWidth === 0) return null;
 
     const width = this.image.naturalWidth;
     const height = this.image.naturalHeight;
 
-    // Create a temporary offscreen canvas
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = width;
     tempCanvas.height = height;
     const tempCtx = tempCanvas.getContext('2d');
-
     if (!tempCtx) return null;
 
-    // Draw the current image without transformations
     tempCtx.drawImage(this.image, 0, 0, width, height);
-
-    // Extract the raw pixel data
     return tempCtx.getImageData(0, 0, width, height);
   }
 
-  // ===================== Part 4: AI Mask Compositing =====================
+  // ===== AI Mask =====
 
-  /**
-   * Applies an AI-generated mask to the image.
-   * The mask is an ImageData where the alpha channel determines visibility
-   * (0 = transparent background, 255 = solid foreground).
-   */
   public applyMask(maskImageData: ImageData): void {
     if (!this.image.complete || this.image.naturalWidth === 0) return;
 
     const width = this.image.naturalWidth;
     const height = this.image.naturalHeight;
 
-    // Create an invisible offscreen mask buffer matching the original image size
     if (!this.maskCanvas || this.maskCanvas.width !== width || this.maskCanvas.height !== height) {
       this.maskCanvas = document.createElement('canvas');
       this.maskCanvas.width = width;
@@ -220,18 +202,13 @@ export class CanvasManager {
 
     if (!this.maskCtx) return;
 
-    // Write the AI mask data to the offscreen mask buffer
     this.maskCtx.putImageData(maskImageData, 0, 0);
     this.hasActiveMask = true;
 
-    // Trigger a re-render
     this.needsRender = true;
     this.scheduleRender();
   }
 
-  /**
-   * Clears the active AI mask.
-   */
   public clearMask(): void {
     this.hasActiveMask = false;
     this.maskCanvas = null;
@@ -240,19 +217,12 @@ export class CanvasManager {
     this.scheduleRender();
   }
 
-  /**
-   * Returns whether an AI mask is currently active.
-   */
   public isMaskActive(): boolean {
     return this.hasActiveMask;
   }
 
-  // ===================== Main Rendering Loop =====================
+  // ===== Main Rendering Loop (Issue 1 fix: center origin + offset draw) =====
 
-  /**
-   * The main rendering method with mask compositing support.
-   * If a mask is active, it applies it using destination-in compositing.
-   */
   public render(): void {
     const ctx = this.ctx;
     const img = this.image;
@@ -261,39 +231,40 @@ export class CanvasManager {
 
     const canvasWidth = this.getCanvasWidth();
     const canvasHeight = this.getCanvasHeight();
-    const centerX = canvasWidth / 2;
-    const centerY = canvasHeight / 2;
 
     // Wipe the previous frame
     ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
+    // Save pristine state
     ctx.save();
 
-    // Step 1-4: Apply transformation matrix
+    // Step 1: Translate to CENTER of viewport (Issue 1 fix)
+    const centerX = canvasWidth / 2;
+    const centerY = canvasHeight / 2;
     ctx.translate(centerX, centerY);
+
+    // Step 2: Rotation
     ctx.rotate((this.state.rotation * Math.PI) / 180);
+
+    // Step 3: Scale (mirror + zoom)
     ctx.scale(
       (this.state.flipX ? -1 : 1) * this.state.zoom,
       (this.state.flipY ? -1 : 1) * this.state.zoom
     );
+
+    // Step 4: Pan
     ctx.translate(this.state.translateX, this.state.translateY);
 
-    // Step 5: Draw the original image
+    // Step 5: Draw image offset by NEGATIVE half its dimensions (Issue 1 fix)
+    // This anchors the center of the image to the center of the viewport
     ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
 
-    // Step 6: If a mask is active, apply it using destination-in compositing
+    ctx.restore();
+    ctx.save();
+
+    // Step 6: If mask active, apply destination-in compositing
     if (this.hasActiveMask && this.maskCanvas) {
-      // destination-in: only keep pixels where the mask is opaque
-      ctx.globalCompositeOperation = 'destination-in';
-
-      // Reset transform to draw mask at canvas coordinates
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      const dpr = window.devicePixelRatio || 1;
-      ctx.scale(dpr, dpr);
-
-      // Draw the mask buffer over the canvas
-      // We need to draw it scaled to the viewport, respecting the transform
-      ctx.save();
+      // Redraw the image first (needed for destination-in)
       ctx.translate(centerX, centerY);
       ctx.rotate((this.state.rotation * Math.PI) / 180);
       ctx.scale(
@@ -301,10 +272,15 @@ export class CanvasManager {
         (this.state.flipY ? -1 : 1) * this.state.zoom
       );
       ctx.translate(this.state.translateX, this.state.translateY);
-      ctx.drawImage(this.maskCanvas, -img.naturalWidth / 2, -img.naturalHeight / 2);
-      ctx.restore();
+      ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
 
-      // Reset composite operation back to normal
+      // destination-in: keep only pixels where mask alpha > 0
+      ctx.globalCompositeOperation = 'destination-in';
+
+      // Draw mask at same transform
+      ctx.drawImage(this.maskCanvas, -img.naturalWidth / 2, -img.naturalHeight / 2);
+
+      // Reset composite mode
       ctx.globalCompositeOperation = 'source-over';
     }
 
@@ -312,13 +288,10 @@ export class CanvasManager {
 
     this.needsRender = false;
 
-    // Notify the WebGL pipeline to refresh its texture from this canvas
+    // Notify WebGL pipeline
     this.onPostRender?.();
   }
 
-  /**
-   * Schedules a render using requestAnimationFrame to sync with the monitor's refresh rate.
-   */
   private scheduleRender(): void {
     if (this.animationFrameId !== null) return;
 
@@ -330,7 +303,7 @@ export class CanvasManager {
     });
   }
 
-  // ===== Mouse/Touch Interaction Handlers =====
+  // ===== Mouse/Touch =====
 
   private setupEventListeners(): void {
     this.canvas.addEventListener('mousedown', this.onPointerDown);
@@ -420,12 +393,17 @@ export class CanvasManager {
     this.scheduleRender();
   };
 
+  /**
+   * Issue 3 fix: Clamp boundaries to prevent dragging image out of view.
+   * Calculates maxOffsetX/Y dynamically based on current zoom.
+   */
   private clampBoundaries(): void {
     if (this.image.naturalWidth === 0) return;
 
     const canvasWidth = this.getCanvasWidth();
     const canvasHeight = this.getCanvasHeight();
 
+    // Max allowed offsets — prevents the edge of the image from going past the viewport edge
     const maxOffsetX = Math.max(0, (this.image.naturalWidth * this.state.zoom - canvasWidth) / 2);
     const maxOffsetY = Math.max(0, (this.image.naturalHeight * this.state.zoom - canvasHeight) / 2);
 
@@ -472,36 +450,21 @@ export class CanvasManager {
     return this.image.naturalHeight;
   }
 
-  /**
-   * Returns the raw HTMLImageElement for use by ExportEngine.
-   */
   public getImageElement(): HTMLImageElement {
     return this.image;
   }
 
-  // ===================== Part 6: Lerp Animation for Auto-Crop =====================
+  // ===== Lerp Animation =====
 
-  /**
-   * Smoothly animates the viewport to center on a focal point (from AI smart crop).
-   * Uses Linear Interpolation (Lerp) over ~400ms.
-   *
-   * @param focalX - X coordinate of the focal point (in image pixels)
-   * @param focalY - Y coordinate of the focal point (in image pixels)
-   */
   public animateToFocalPoint(focalX: number, focalY: number): void {
-    // Stop any existing lerp animation
     this.stopLerpAnimation();
 
     const imgW = this.image.naturalWidth;
     const imgH = this.image.naturalHeight;
 
-    // Calculate target translate to center the focal point
-    // In the current transform, translate is applied after center translation
-    // So we need to offset: focal point in image coords -> screen coords
     const targetTranslateX = -(focalX - imgW / 2);
     const targetTranslateY = -(focalY - imgH / 2);
 
-    // Store start and target values
     this.lerpStart = {
       translateX: this.state.translateX,
       translateY: this.state.translateY,
@@ -511,7 +474,7 @@ export class CanvasManager {
     this.lerpTarget = {
       translateX: targetTranslateX,
       translateY: targetTranslateY,
-      zoom: this.state.zoom, // Keep zoom constant during focal animation
+      zoom: this.state.zoom,
     };
 
     this.lerpProgress = 0;
@@ -524,26 +487,20 @@ export class CanvasManager {
     const elapsed = performance.now() - startTime;
     this.lerpProgress = Math.min(elapsed / this.LERP_DURATION_MS, 1);
 
-    // Ease-out cubic for smooth deceleration
     const t = 1 - Math.pow(1 - this.lerpProgress, 3);
 
-    // Apply Lerp formula: current = start + (target - start) * t
     this.state.translateX = this.lerpStart.translateX + (this.lerpTarget.translateX - this.lerpStart.translateX) * t;
     this.state.translateY = this.lerpStart.translateY + (this.lerpTarget.translateY - this.lerpStart.translateY) * t;
     this.state.zoom = this.lerpStart.zoom + (this.lerpTarget.zoom - this.lerpStart.zoom) * t;
 
     this.clampBoundaries();
-
-    // Trigger Phase 1 render
     this.needsRender = true;
     this.scheduleRender();
 
-    // Halt when difference is less than 0.5 pixels
     const dx = Math.abs(this.state.translateX - this.lerpTarget.translateX);
     const dy = Math.abs(this.state.translateY - this.lerpTarget.translateY);
 
     if (this.lerpProgress >= 1 || (dx < 0.5 && dy < 0.5)) {
-      // Snap to final position
       this.state.translateX = this.lerpTarget.translateX;
       this.state.translateY = this.lerpTarget.translateY;
       this.state.zoom = this.lerpTarget.zoom;
@@ -555,7 +512,6 @@ export class CanvasManager {
       return;
     }
 
-    // Continue the animation loop
     this.lerpAnimationFrameId = requestAnimationFrame(() => this.runLerpAnimation(startTime));
   }
 
