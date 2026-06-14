@@ -472,6 +472,13 @@ export class CanvasManager {
     return this.image.naturalHeight;
   }
 
+  /**
+   * Returns the raw HTMLImageElement for use by ExportEngine.
+   */
+  public getImageElement(): HTMLImageElement {
+    return this.image;
+  }
+
   // ===================== Part 6: Lerp Animation for Auto-Crop =====================
 
   /**

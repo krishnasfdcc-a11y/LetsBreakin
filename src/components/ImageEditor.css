@@ -7,7 +7,6 @@
   color: #e0e0e0;
 }
 
-/* Toolbar */
 .toolbar {
   display: flex;
   align-items: center;
@@ -45,8 +44,9 @@
 }
 
 .toolbar-button:disabled {
-  opacity: 0.5;
+  opacity: 0.3;
   cursor: not-allowed;
+  pointer-events: none;
 }
 
 .upload-button {
@@ -61,7 +61,6 @@
   border-color: #1558d4;
 }
 
-/* AI action buttons */
 .ai-button {
   background: #2d1b69;
   border-color: #4a2d8a;
@@ -74,6 +73,18 @@
   color: #e0d0ff;
 }
 
+.export-button {
+  background: #065f46;
+  border-color: #059669;
+  color: #a7f3d0;
+}
+
+.export-button:hover:not(:disabled) {
+  background: #047857;
+  border-color: #10b981;
+  color: #d1fae5;
+}
+
 .toolbar-separator {
   width: 1px;
   height: 24px;
@@ -81,7 +92,16 @@
   margin: 0 4px;
 }
 
-/* Loading indicator */
+.save-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-size: 11px;
+  color: #4ade80;
+  white-space: nowrap;
+}
+
 .loading-indicator {
   display: flex;
   align-items: center;
@@ -131,7 +151,6 @@
   to { transform: rotate(360deg); }
 }
 
-/* Error bar */
 .error-bar {
   display: flex;
   align-items: center;
@@ -153,7 +172,6 @@
   line-height: 1;
 }
 
-/* Dual-canvas container */
 .canvas-container {
   position: relative;
   width: 100%;
@@ -162,7 +180,6 @@
   overflow: hidden;
 }
 
-/* Phase 1 canvas - offscreen memory buffer for transformations */
 #main-viewport {
   position: absolute;
   top: 0;
@@ -179,7 +196,6 @@
   cursor: grabbing;
 }
 
-/* WebGL canvas - sits above, samples Phase 1 as a texture */
 #webgl-viewport {
   position: absolute;
   top: 0;
@@ -191,14 +207,6 @@
   display: block;
 }
 
-/* Viewport (legacy - kept for empty state positioning) */
-.viewport {
-  flex: 1;
-  position: relative;
-  overflow: hidden;
-}
-
-/* Empty state */
 .empty-state {
   position: absolute;
   inset: 0;
@@ -231,7 +239,6 @@
   opacity: 0.7;
 }
 
-/* ===== Filter Controls Bar ===== */
 .filter-bar {
   display: flex;
   align-items: center;
@@ -304,7 +311,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Reset button */
 .filter-reset {
   display: flex;
   align-items: center;
