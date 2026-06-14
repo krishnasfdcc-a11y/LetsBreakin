@@ -419,12 +419,6 @@ export class CanvasManager {
     requestAnimationFrame(() => this.renderLoop2D());
   }
 
-  private clearCanvas2D(): void {
-    // This method is no longer strictly needed as clearing is done in renderLoop2D
-    // But keeping it for now if other parts of the code still call it.
-    this.ctx2D.clearRect(0, 0, this.canvas2D.width, this.canvas2D.height);
-  }
-
   private drawTransformedImage(): void {
     if (!this.img) return;
     const { zoom, translateX, translateY, rotation, flipX, flipY } = this.state;
@@ -545,7 +539,7 @@ export class CanvasManager {
    *  INTERNAL — Worker message handlers
    * ================================================================ */
 
-  private handleDecoderMessage(e: MessageEvent): void {
+  private async handleDecoderMessage(e: MessageEvent): Promise<void> {
     const { blob, error } = e.data;
     if (error) {
       this.callbacks.onError?.(`HEIC decode: ${error}`);
