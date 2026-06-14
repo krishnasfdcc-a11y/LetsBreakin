@@ -2,7 +2,7 @@
  * AI Worker Phase 3 - Client-Side AI Integration
  *
  * Manages two AI pipelines inside a dedicated Web Worker:
- * 1. Background Removal (RMBG-1.4 via @xenova/transformers)
+ * 1. Background Removal (RMBG-1.4 via @huggingface/transformers v3)
  * 2. Smart Crop (COCO-SSD via TensorFlow.js)
  *
  * The worker uses a Singleton pattern for model loading to ensure
@@ -67,30 +67,27 @@ self.addEventListener('message', async (event: MessageEvent<RequestMessage>) => 
   }
 });
 
-// ===================== Part 2: Transformers.js Setup =====================
+// ===================== Part 2: HuggingFace Transformers.js v3 Setup =====================
 
 let transformersPipeline: any = null;
-let transformersModule: any = null;
 
 /**
- * Singleton accessor for the Transformers.js background removal pipeline.
+ * Singleton accessor for the HuggingFace Transformers.js v3 background removal pipeline.
  * Loads the model only once and caches it in IndexedDB via browser cache.
+ * v3 natively supports briaai/RMBG-1.4 (SegformerForSemanticSegmentation).
  */
 async function getBackgroundRemovalPipeline(): Promise<any> {
   if (transformersPipeline) return transformersPipeline;
 
-  if (!transformersModule) {
-    transformersModule = await import('@xenova/transformers');
-  }
-
-  const { pipeline, env } = transformersModule;
+  // Dynamic import of @huggingface/transformers v3
+  // This package natively supports briaai/RMBG-1.4 without model architecture errors
+  const { pipeline, env } = await import('@huggingface/transformers');
 
   // Explicitly configure environment:
   // allowLocalModels = false forces fetch from HF Hub on first run
   // useBrowserCache = true traps downloaded model in IndexedDB for subsequent runs
   env.allowLocalModels = false;
   env.useBrowserCache = true;
-  env.useFSCache = false;
 
   // Report download progress
   const progressCallback = (progressData: any) => {
@@ -106,6 +103,7 @@ async function getBackgroundRemovalPipeline(): Promise<any> {
   };
 
   // Initialize the image segmentation pipeline with progress tracking
+  // @huggingface/transformers v3 natively supports briaai/RMBG-1.4 (SegformerForSemanticSegmentation)
   transformersPipeline = await pipeline('image-segmentation', 'briaai/RMBG-1.4', {
     progress_callback: progressCallback,
   });
@@ -129,6 +127,7 @@ async function handleRemoveBackground(imageData: ImageData, requestId?: string):
   const segmenter = await getBackgroundRemovalPipeline();
 
   // Pass the raw pixel data into the segmenter
+  // @huggingface/transformers v3 accepts ImageData directly
   const result = await segmenter(imageData, {
     mask_threshold: 0.5,
   });
@@ -161,7 +160,6 @@ async function handleRemoveBackground(imageData: ImageData, requestId?: string):
   }
 
   // Transfer the mask back to the main thread
-  // Use a plain object cast for transferables compatibility
   const transferables: Transferable[] = [maskImageData.data.buffer];
   (self as any).postMessage(
     {
